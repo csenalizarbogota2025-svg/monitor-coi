@@ -1,26 +1,20 @@
-# Monitor COI – SDM Bogotá
+# Monitor COI – SDM Bogotá v4
 
-Aplicación Streamlit para analizar el Reporte Consolidado de Obras de Infraestructura (COI) de la Secretaría Distrital de Movilidad.
+Aplicación Streamlit para analizar el COI oficial de la Secretaría Distrital de Movilidad.
 
-## Empresas configuradas
+## Mejoras v4
+- Identificación conservadora: para Segurvial y Señalizar exige coincidencia de CONTRATISTA + No. CONTRATO.
+- Mantiene las 16 columnas oficiales del COI como base del resultado.
+- Filtros por empresa, contratista, No. CONTRATO, estado, localidad y búsqueda libre.
+- Dashboard gráfico.
+- Trazabilidad por No. del COI y descarga de la página original.
+- Excel y PDF por empresa.
 
-- CONSORCIO SEGURVIAL BOGOTÁ — contrato 2024-3651
-- CONSORCIO SEÑALIZAR BOGOTÁ 2025 — contrato 2024-3652
-- SOCINTER S.A.S. — identificación por contratista
+## Contratos configurados
+- CONSORCIO SEGURVIAL BOGOTÁ: 2024-3651
+- CONSORCIO SEÑALIZAR BOGOTÁ 2025: 2024-3652
+- SOCINTER S.A.S.: por nombre de contratista.
 
-## Esta versión
-
-- Conserva las 16 columnas oficiales del COI.
-- Extrae cada fila individual del COI.
-- No usa menciones de empresas en OBSERVACIONES para identificar el contratista.
-- Usa el No. CONTRATO como validación para Segurvial y Señalizar.
-- Permite filtrar por empresa, contratista/nombre, contrato, estado y localidad.
-- Incluye dashboard gráfico.
-- Exporta Excel.
-- Genera PDF por empresa con las páginas originales correspondientes.
-
-## Streamlit
-
-Main file: `app.py`
-Requirements: `requirements.txt`
-Branch: `main`
+## Streamlit Cloud
+Main file: app.py
+Requirements: requirements.txt
