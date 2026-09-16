@@ -134,8 +134,14 @@ def send_email(pdf_path, xlsx_path, summary_path, meta, df):
           f'Fecha del COI: {dt:%d/%m/%Y}\nRegistros extraídos: {len(df):,}\nEmpresas/contratistas: {df["CONTRATISTA"].nunique():,}\nContratos: {df["CONTRATO CANÓNICO"].nunique():,}\n\n'
           f'Fuente oficial: {url}\n\nAdjuntos:\n- PDF original del COI\n- Excel completo procesado\n- PDF resumen del análisis\n')
     msg.set_content(body)
-    for p,ctype,subtype in [(pdf_path,'application','pdf'),(xlsx_path,'application','vnd.openxmlformats-officedocument.spreadsheetml.sheet'),(summary_path,'application','pdf')]:
-        payload=Path(p).read_bytes(); msg.add_attachment(payload,maintype=ctype.split('/')[0],subtype=ctype.split('/')[1],filename=Path(p).name)
+    attachments = [
+        (pdf_path, 'application', 'pdf'),
+        (xlsx_path, 'application', 'vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
+        (summary_path, 'application', 'pdf'),
+    ]
+    for path, maintype, subtype in attachments:
+        payload = Path(path).read_bytes()
+        msg.add_attachment(payload, maintype=maintype, subtype=subtype, filename=Path(path).name)
     context=ssl.create_default_context()
     with smtplib.SMTP_SSL('smtp.gmail.com',465,context=context,timeout=60) as smtp:
         smtp.login(user,app_pw); smtp.send_message(msg)
