@@ -1,4 +1,4 @@
-import io, re
+import io,re,html
 from pathlib import Path
 import fitz
 import pandas as pd
@@ -8,414 +8,252 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-APP_VERSION = "9.0"
-APP_NAME = "Monitor COI"
-COLS = [
-    "No.", "CIV INICIO", "CIV FIN", "DIRECCIÓN DE LA OBRA INICIO", "DIRECCIÓN DE LA OBRA FIN",
-    "CONTRATISTA", "FECHA INICIO", "FECHA FIN", "HORARIO DE TRABAJO", "HORARIO DE CIERRE",
-    "No. CONTRATO", "OBSERVACIONES", "AUTORIZADO", "LOCALIDAD", "ING. RESPONSABLE", "No RADICADO SDM"
-]
-ANALYSIS_COLS = [
-    "ESTADO INTERPRETADO", "PÁGINA PDF", "PÁGINA COI", "SECCIÓN", "CONTRATO CANÓNICO"
-]
+APP_VERSION='10.0'
+APP_NAME='Monitor COI'
+COLS=['No.','CIV INICIO','CIV FIN','DIRECCIÓN DE LA OBRA INICIO','DIRECCIÓN DE LA OBRA FIN','CONTRATISTA','FECHA INICIO','FECHA FIN','HORARIO DE TRABAJO','HORARIO DE CIERRE','No. CONTRATO','OBSERVACIONES','AUTORIZADO','LOCALIDAD','ING. RESPONSABLE','No RADICADO SDM']
 
-st.set_page_config(page_title=f"{APP_NAME} – SDM Bogotá", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title=f'{APP_NAME} · SDM Bogotá',page_icon='📊',layout='wide',initial_sidebar_state='expanded')
+
+st.markdown('''<style>
+.block-container{padding-top:1.2rem;padding-bottom:2rem;max-width:1500px}
+.hero{padding:22px 26px;border-radius:18px;background:linear-gradient(120deg,#eef6ff,#f8fbff);border:1px solid #dbe8f5;margin-bottom:18px}
+.hero h1{margin:0;color:#17365d;font-size:32px}.hero p{margin:8px 0 0;color:#5d6b7a}
+.small{font-size:12px;color:#718096}.step{font-weight:700;color:#17365d;font-size:18px}
+.stButton>button{border-radius:10px;font-weight:700}
+.metricbox{border:1px solid #e2e8f0;border-radius:14px;padding:12px 14px;background:white}
+</style>''',unsafe_allow_html=True)
 
 # ---------- Helpers ----------
-def norm(s):
-    s = str(s or "").upper().replace("\u00ad", "")
-    s = s.translate(str.maketrans("ÁÉÍÓÚÜÑ", "AEIOUUN"))
-    s = re.sub(r"[^A-Z0-9]+", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
-
 def clean(s):
-    return re.sub(r"\s+", " ", str(s or "")).strip(" |:-")
+    return re.sub(r'\s+',' ',str(s or '').replace('\u00a0',' ')).strip()
 
-def canonical_contract(s):
-    n = norm(s)
-    nums = re.findall(r"\d{3,6}|20\d{2}", n)
-    year = next((x for x in nums if re.fullmatch(r"20\d{2}", x)), None)
-    if year:
-        others = [x for x in nums if x != year]
-        if others:
-            return f"{year}-{others[-1]}"
-    return re.sub(r"[^A-Z0-9]", "", n)
+def norm(s):
+    import unicodedata
+    s=clean(s).upper()
+    s=''.join(c for c in unicodedata.normalize('NFD',s) if unicodedata.category(c)!='Mn')
+    return re.sub(r'[^A-Z0-9]+','',s)
 
-def get_printed_page(text, fallback):
-    m = re.search(r"P[áa]gina\s+(\d+)\s+de\s+(\d+)", text, re.I)
-    return int(m.group(1)) if m else fallback
+def contract_canonical(s):
+    s=clean(s).upper().replace(' ','')
+    m=re.search(r'(?:SDM-)?(\d{3,5})-(20\d{2})$',s)
+    if m:return f'{m.group(2)}-{m.group(1)}'
+    m=re.search(r'(20\d{2})-(\d{3,5})$',s)
+    if m:return f'{m.group(1)}-{m.group(2)}'
+    return s
 
-def get_section(text):
-    m = re.search(r"SECCI[ÓO]N\s+[^\n]+", text, re.I)
-    return clean(m.group(0)) if m else ""
+def is_civ(s): return bool(re.fullmatch(r'\d{5,10}',clean(s)))
 
-def classify(row):
-    auth = norm(row.get("AUTORIZADO", ""))
-    obs = norm(row.get("OBSERVACIONES", ""))
-    if "FORMALIZACION" in auth or "EMERGENCIA" in auth or "FORMALIZA LA EMERGENCIA" in obs:
-        return "FORMALIZACIÓN DE EMERGENCIA"
-    if auth in {"NO", "NO AUTORIZADO", "NO AUTORIZADA"} or auth.startswith("NO "):
-        return "NO AUTORIZADO"
-    if auth in {"SI", "VIGENTE", "AUTORIZADO", "AUTORIZADA"} or auth.startswith("SI "):
-        return "AUTORIZADO"
-    if "NO AUTORIZA PMT" in obs:
-        return "NO AUTORIZADO"
-    if "AUTORIZA PMT" in obs:
-        return "AUTORIZADO"
-    return "OTRO"
-
-def looks_like_data_row(row):
-    if not row or len(row) < 16:
-        return False
-    first = clean(row[0])
-    if not re.fullmatch(r"\d{4,7}", first):
-        return False
-    # CIVs in the official COI are numeric. This validation catches the
-    # exact failure where text from the next cell leaked into CIV.
-    civ1, civ2 = clean(row[1]), clean(row[2])
-    if civ1 and not re.fullmatch(r"\d{5,10}", civ1):
-        return False
-    if civ2 and not re.fullmatch(r"\d{5,10}", civ2):
-        return False
-    return True
-
-def table_boundaries(page):
-    """Devuelve las 17 líneas verticales de la tabla COI (16 columnas)."""
+def find_verticals(page, y0=250):
     xs=[]
+    outer=[]
     for dr in page.get_drawings():
-        for item in dr.get("items",[]):
-            if item[0] == "l":
-                p1,p2=item[1],item[2]
-                if abs(p1.x-p2.x)<1.5 and abs(p2.y-p1.y)>500:
-                    xs.append(float(p1.x))
-            elif item[0] == "re":
-                r=item[1]
-                if r.width<5 and r.height>500:
-                    xs.append(float(r.x0))
+        for item in dr.get('items',[]):
+            if item[0]=='l':
+                a,b=item[1],item[2]
+                if abs(a.x-b.x)<1.5 and max(a.y,b.y)-min(a.y,b.y)>100 and max(a.y,b.y)>y0:
+                    xs.append(round(a.x,1))
+    xs=sorted(xs)
     out=[]
-    for x in sorted(xs):
-        if not out or abs(x-out[-1])>2:
-            out.append(x)
-    return out if len(out)==17 else []
-
-def table_horizontal_lines(page):
-    """Líneas horizontales que delimitan las filas de la tabla COI."""
-    ys=[]
-    for dr in page.get_drawings():
-        for item in dr.get("items",[]):
-            if item[0] == "l":
-                p1,p2=item[1],item[2]
-                if abs(p1.y-p2.y)<1.5 and abs(p2.x-p1.x)>1500:
-                    ys.append(float(p1.y))
-            elif item[0] == "re":
-                r=item[1]
-                if r.height<5 and r.width>1500:
-                    ys.append(float(r.y0))
-    out=[]
-    for y in sorted(ys):
-        if not out or abs(y-out[-1])>2:
-            out.append(y)
+    for x in xs:
+        if not out or abs(x-out[-1])>2: out.append(x)
     return out
 
-def extract_rows_from_words(page, xs):
-    """Extrae cada fila dentro de sus límites horizontales reales.
-    A diferencia de agrupar por la posición de la primera palabra, aquí cada
-    fila está delimitada por las líneas horizontales dibujadas en el COI.
-    Esto evita que textos multilínea de dirección/contratista se recorten o
-    se mezclen con la fila siguiente.
-    """
-    if len(xs)!=17:
-        return []
-    ys=table_horizontal_lines(page)
-    if len(ys)<3:
-        return []
-    words=page.get_text("words")
-    result=[]
-    import bisect
+def find_horizontal_rows(page):
+    lines=[]
+    for dr in page.get_drawings():
+        for item in dr.get('items',[]):
+            if item[0]=='l':
+                a,b=item[1],item[2]
+                if abs(a.y-b.y)<1.5 and (b.x-a.x)>1700:
+                    lines.append(round((a.y+b.y)/2,1))
+    lines=sorted(lines)
+    out=[]
+    for y in lines:
+        if not out or abs(y-out[-1])>2: out.append(y)
+    return out
+
+def extract_page(page):
+    words=page.get_text('words')
+    # Dynamic geometry: use the actual vertical borders drawn by the PDF.
+    xs=find_verticals(page)
+    # Outer borders are often shorter than the internal vertical lines; recover them from full-width table lines.
+    hfull=[]
+    for dr in page.get_drawings():
+        for item in dr.get('items',[]):
+            if item[0]=='l':
+                a,b=item[1],item[2]
+                if abs(a.y-b.y)<1.5 and (b.x-a.x)>1700:
+                    hfull.append((min(a.x,b.x),max(a.x,b.x),round((a.y+b.y)/2,1)))
+    if hfull:
+        xmin=min(x[0] for x in hfull); xmax=max(x[1] for x in hfull)
+        xs=[xmin]+xs+[xmax]
+    xs=sorted(set(round(x,1) for x in xs))
+    # The official form has 17 column borders. Remove duplicates/extra lines by matching the stable layout.
+    if len(xs)>17:
+        target=[74,123,191,259,358,456,585,652,718,796,874,952,1593,1688,1785,1886,2009]
+        chosen=[]
+        for t in target:
+            nearest=min(xs,key=lambda x:abs(x-t))
+            if nearest not in chosen: chosen.append(nearest)
+        if len(chosen)==17: xs=chosen
+    if len(xs)!=17:return []
+    ys=find_horizontal_rows(page)
+    # row intervals are horizontal lines after header. Find intervals containing numeric No. in first cell.
+    if len(ys)<2:return []
+    out=[]
     for ya,yb in zip(ys,ys[1:]):
-        # Ignore document/header bands. Data rows contain a numeric No. in col 0.
-        if yb-ya<10 or ya<250:
-            continue
-        cells=[[] for _ in range(16)]
-        for w in words:
-            x0,y0,x1,y1,t,*_=w
+        if yb-ya<15: continue
+        rowwords=[w for w in words if w[1]>=ya-1 and w[3]<=yb+1]
+        nums=[w for w in rowwords if xs[0]-3<=w[0]<=xs[1]+3 and re.fullmatch(r'\d{3,8}',w[4].strip())]
+        if not nums: continue
+        cells=['' for _ in range(16)]
+        for w in rowwords:
+            x0,y0,x1,y1,text,*_=w
             cx=(x0+x1)/2
-            cy=(y0+y1)/2
-            if not (ya+1 <= cy <= yb-1):
-                continue
-            ci=bisect.bisect_right(xs,cx)-1
-            if 0<=ci<16:
-                cells[ci].append((y0,x0,t))
-        vals=[]
-        for c in cells:
-            c.sort(key=lambda z:(z[0],z[1]))
-            vals.append(clean(" ".join(z[2] for z in c)))
-        if looks_like_data_row(vals):
-            result.append(vals)
-    return result
+            # assign to x band; ignore text outside table
+            j=None
+            for k in range(16):
+                if xs[k]-1<=cx<=xs[k+1]+1:
+                    j=k;break
+            if j is not None:
+                cells[j]=(cells[j]+' '+text).strip()
+        cells=[clean(c) for c in cells]
+        if is_civ(cells[1]) or (cells[0].isdigit() and cells[0]):
+            # CIV cells must not contain names; salvage first numeric token if necessary
+            for j in [1,2]:
+                m=re.match(r'(\d{5,10})',cells[j])
+                cells[j]=m.group(1) if m else (cells[j] if cells[j] in ['N/A','-'] else cells[j])
+            out.append(cells)
+    return out
 
-def parse_pdf(data):
-    doc=fitz.open(stream=data,filetype="pdf")
-    records=[]; seen=set(); pages_scanned=0
-    total=len(doc)
-    progress=st.progress(0,text="Preparando análisis…")
-    for pidx,page in enumerate(doc):
-        text=page.get_text("text")
-        nt=norm(text)
-        if "CODIGO DE IDENTIFICACION VIAL CIV" not in nt or "CONTRATISTA" not in nt or "NO CONTRATO" not in nt:
-            progress.progress((pidx+1)/total,text=f"Revisando página {pidx+1} de {total}…")
-            continue
-        xs=table_boundaries(page)
-        rows=extract_rows_from_words(page,xs)
-        if rows: pages_scanned+=1
-        printed=get_printed_page(text,pidx+1); section=get_section(text)
-        for vals in rows:
-            key=(pidx+1,vals[0],vals[1],vals[2],vals[5],vals[10])
-            if key in seen: continue
-            seen.add(key)
-            row=dict(zip(COLS,vals))
-            row["ESTADO INTERPRETADO"]=classify(row)
-            row["PÁGINA PDF"]=pidx+1
-            row["PÁGINA COI"]=printed
-            row["SECCIÓN"]=section
-            row["CONTRATO CANÓNICO"]=canonical_contract(row["No. CONTRATO"])
-            records.append(row)
-        progress.progress((pidx+1)/total,text=f"Analizando página {pidx+1} de {total}…")
-    progress.empty()
-    return doc,pd.DataFrame(records,columns=COLS+ANALYSIS_COLS),pages_scanned,0
+def extract_pdf(data):
+    doc=fitz.open(stream=data,filetype='pdf')
+    records=[]; page_diag=[]; sections={}
+    for pi,page in enumerate(doc):
+        rows=extract_page(page)
+        txt=page.get_text('text').upper()
+        section='SECCIÓN 1' if 'SECCIÓN 1.' in txt else ('SECCIÓN 2' if 'SECCIÓN 2.' in txt else '')
+        page_diag.append((pi+1,len(rows)))
+        for r in rows:
+            r=r[:16]+['']*max(0,16-len(r))
+            rec=dict(zip(COLS,r[:16])); rec['PÁGINA PDF']=pi+1; rec['SECCIÓN']=section; rec['CONTRATO CANÓNICO']=contract_canonical(rec['No. CONTRATO'])
+            auth=norm(rec['AUTORIZADO']); obs=norm(rec['OBSERVACIONES'])
+            if 'EMERGENCIA' in auth or 'FORMALIZACIONDEEMERGENCIA' in auth: state='FORMALIZACIÓN DE EMERGENCIA'
+            elif auth in ('NO','NOAUTORIZADO','NOAUTORIZADA'): state='NO AUTORIZADO'
+            elif auth in ('SI','SIAUTORIZADO','AUTORIZADO','AUTORIZADOCONOBSERVACIONES') or 'AUTORIZA' in obs: state='AUTORIZADO'
+            else: state=clean(rec['AUTORIZADO']) or 'OTRO'
+            rec['ESTADO INTERPRETADO']=state
+            records.append(rec)
+    doc.close()
+    return pd.DataFrame(records),page_diag
 
-def schedule_analysis(df):
-    if df.empty:
-        return pd.DataFrame(columns=["HORARIO DE TRABAJO","REGISTROS","AUTORIZADOS","NO AUTORIZADOS","EMERGENCIAS"])
-    t=df.copy(); t["HORARIO NORMALIZADO"]=t["HORARIO DE TRABAJO"].fillna("").map(clean).map(norm).replace("","SIN DATO")
-    out=t.groupby("HORARIO NORMALIZADO").agg(
-        REGISTROS=("No.","size"),
-        AUTORIZADOS=("ESTADO INTERPRETADO",lambda s:int((s=="AUTORIZADO").sum())),
-        NO_AUTORIZADOS=("ESTADO INTERPRETADO",lambda s:int((s=="NO AUTORIZADO").sum())),
-        EMERGENCIAS=("ESTADO INTERPRETADO",lambda s:int((s=="FORMALIZACIÓN DE EMERGENCIA").sum())),
-    ).reset_index().rename(columns={"HORARIO NORMALIZADO":"HORARIO DE TRABAJO"})
-    return out.sort_values(["REGISTROS","HORARIO DE TRABAJO"],ascending=[False,True])
-
-def company_summary(df):
-    return df.groupby("CONTRATISTA",dropna=False).agg(
-        REGISTROS=("No.","size"),
-        AUTORIZADOS=("ESTADO INTERPRETADO",lambda s:int((s=="AUTORIZADO").sum())),
-        NO_AUTORIZADOS=("ESTADO INTERPRETADO",lambda s:int((s=="NO AUTORIZADO").sum())),
-        EMERGENCIAS=("ESTADO INTERPRETADO",lambda s:int((s=="FORMALIZACIÓN DE EMERGENCIA").sum())),
-        CONTRATOS=("No. CONTRATO",lambda s:s.nunique()),
-    ).reset_index().sort_values("REGISTROS",ascending=False)
-
-def contract_summary(df):
-    return df.groupby(["No. CONTRATO","CONTRATISTA"],dropna=False).agg(
-        REGISTROS=("No.","size"),
-        AUTORIZADOS=("ESTADO INTERPRETADO",lambda s:int((s=="AUTORIZADO").sum())),
-        NO_AUTORIZADOS=("ESTADO INTERPRETADO",lambda s:int((s=="NO AUTORIZADO").sum())),
-        EMERGENCIAS=("ESTADO INTERPRETADO",lambda s:int((s=="FORMALIZACIÓN DE EMERGENCIA").sum())),
-    ).reset_index().sort_values("REGISTROS",ascending=False)
-
-def make_excel(df, pdf_name):
-    out=io.BytesIO(); horarios=schedule_analysis(df); empresas=company_summary(df); contratos=contract_summary(df)
-    h24=df["HORARIO DE TRABAJO"].map(norm)=="24 HORAS"
-    resumen=pd.DataFrame({"INDICADOR":["Archivo COI","Registros","Contratistas","Contratos","Autorizados","No autorizados","Formalización de emergencia","Otros estados","Registros 24 HORAS","24 HORAS autorizados"],"VALOR":[pdf_name,len(df),df["CONTRATISTA"].nunique(),df["No. CONTRATO"].nunique(),int((df["ESTADO INTERPRETADO"]=="AUTORIZADO").sum()),int((df["ESTADO INTERPRETADO"]=="NO AUTORIZADO").sum()),int((df["ESTADO INTERPRETADO"]=="FORMALIZACIÓN DE EMERGENCIA").sum()),int((df["ESTADO INTERPRETADO"]=="OTRO").sum()),int(h24.sum()),int((h24&(df["ESTADO INTERPRETADO"]=="AUTORIZADO")).sum())]})
-    with pd.ExcelWriter(out,engine="openpyxl") as w:
-        df.to_excel(w,index=False,sheet_name="COI completo")
-        resumen.to_excel(w,index=False,sheet_name="Resumen")
-        empresas.to_excel(w,index=False,sheet_name="Empresas")
-        contratos.to_excel(w,index=False,sheet_name="Contratos")
-        horarios.to_excel(w,index=False,sheet_name="Horarios")
-        df.groupby("LOCALIDAD",dropna=False).size().reset_index(name="REGISTROS").sort_values("REGISTROS",ascending=False).to_excel(w,index=False,sheet_name="Localidades")
-    out.seek(0); wb=load_workbook(out); wb.calculation.fullCalcOnLoad=True
+def make_excel(df):
+    bio=io.BytesIO()
+    with pd.ExcelWriter(bio,engine='openpyxl') as writer:
+        df.to_excel(writer,index=False,sheet_name='COI completo')
+        summary=pd.DataFrame([{'Indicador':'Registros','Valor':len(df)},{'Indicador':'Autorizados','Valor':int((df['ESTADO INTERPRETADO']=='AUTORIZADO').sum())},{'Indicador':'No autorizados','Valor':int((df['ESTADO INTERPRETADO']=='NO AUTORIZADO').sum())},{'Indicador':'Emergencias','Valor':int((df['ESTADO INTERPRETADO']=='FORMALIZACIÓN DE EMERGENCIA').sum())},{'Indicador':'24 HORAS','Valor':int(df['HORARIO DE TRABAJO'].map(norm).eq('24HORAS').sum())},{'Indicador':'Empresas','Valor':df['CONTRATISTA'].nunique()},{'Indicador':'Contratos','Valor':df['CONTRATO CANÓNICO'].nunique()}])
+        summary.to_excel(writer,index=False,sheet_name='Resumen')
+        emp=df.groupby('CONTRATISTA',dropna=False).agg(REGISTROS=('No.','count'),AUTORIZADOS=('ESTADO INTERPRETADO',lambda s:(s=='AUTORIZADO').sum()),NO_AUTORIZADOS=('ESTADO INTERPRETADO',lambda s:(s=='NO AUTORIZADO').sum()),EMERGENCIAS=('ESTADO INTERPRETADO',lambda s:(s=='FORMALIZACIÓN DE EMERGENCIA').sum()),CONTRATOS=('CONTRATO CANÓNICO','nunique')).reset_index().sort_values('REGISTROS',ascending=False)
+        emp.to_excel(writer,index=False,sheet_name='Empresas')
+        con=df.groupby(['CONTRATO CANÓNICO','No. CONTRATO','CONTRATISTA'],dropna=False).agg(REGISTROS=('No.','count'),AUTORIZADOS=('ESTADO INTERPRETADO',lambda s:(s=='AUTORIZADO').sum()),NO_AUTORIZADOS=('ESTADO INTERPRETADO',lambda s:(s=='NO AUTORIZADO').sum()),EMERGENCIAS=('ESTADO INTERPRETADO',lambda s:(s=='FORMALIZACIÓN DE EMERGENCIA').sum())).reset_index().sort_values('REGISTROS',ascending=False)
+        con.to_excel(writer,index=False,sheet_name='Contratos')
+        hor=df.groupby('HORARIO DE TRABAJO',dropna=False).agg(REGISTROS=('No.','count'),AUTORIZADOS=('ESTADO INTERPRETADO',lambda s:(s=='AUTORIZADO').sum()),NO_AUTORIZADOS=('ESTADO INTERPRETADO',lambda s:(s=='NO AUTORIZADO').sum()),EMERGENCIAS=('ESTADO INTERPRETADO',lambda s:(s=='FORMALIZACIÓN DE EMERGENCIA').sum())).reset_index().sort_values('REGISTROS',ascending=False)
+        hor.to_excel(writer,index=False,sheet_name='Horarios')
+        loc=df.groupby('LOCALIDAD',dropna=False).size().reset_index(name='REGISTROS').sort_values('REGISTROS',ascending=False); loc.to_excel(writer,index=False,sheet_name='Localidades')
+    bio.seek(0)
+    wb=load_workbook(bio); 
     for ws in wb.worksheets:
-        ws.freeze_panes="A2"; ws.auto_filter.ref=ws.dimensions
-        for cell in ws[1]:
-            cell.font=Font(bold=True,color="FFFFFF"); cell.fill=PatternFill("solid",fgColor="17365D"); cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
-        ws.row_dimensions[1].height=30
-        for col in range(1,ws.max_column+1):
-            letter=get_column_letter(col); maxlen=0
-            for row in ws.iter_rows(min_row=2,max_row=min(ws.max_row,250),min_col=col,max_col=col):
-                v=row[0].value
-                maxlen=max(maxlen,len(str(v)) if v is not None else 0)
-            ws.column_dimensions[letter].width=min(max(maxlen+2,12),55)
-        if ws.title=="COI completo":
-            ws.column_dimensions["L"].width=70
-    out2=io.BytesIO(); wb.save(out2); return out2.getvalue()
+        ws.freeze_panes='A2'; ws.auto_filter.ref=ws.dimensions
+        for c in ws[1]: c.font=Font(bold=True,color='FFFFFF'); c.fill=PatternFill('solid',fgColor='17365D'); c.alignment=Alignment(horizontal='center',vertical='center')
+        for col in ws.columns:
+            letter=get_column_letter(col[0].column); ws.column_dimensions[letter].width=min(max(max(len(str(c.value or '')) for c in col)+2,10),55)
+        if ws.title=='COI completo': ws.column_dimensions['L'].width=70
+    out=io.BytesIO(); wb.save(out); out.seek(0); return out.getvalue()
 
-def filtered_pdf(doc,pages):
-    out=fitz.open()
-    for p in sorted(set(int(x) for x in pages)): out.insert_pdf(doc,from_page=p-1,to_page=p-1)
-    return out.tobytes()
+def pdf_pages(data,pages):
+    src=fitz.open(stream=data,filetype='pdf'); out=fitz.open();
+    for p in sorted(set(pages)): out.insert_pdf(src,from_page=p-1,to_page=p-1)
+    b=out.tobytes(); out.close(); src.close(); return b
 
 # ---------- UI ----------
-st.markdown("""
-<style>
-.block-container{padding-top:1rem;padding-bottom:2rem;max-width:1600px}
-.hero{padding:1.25rem 1.5rem;border-radius:22px;background:linear-gradient(135deg,#eef5ff,#ffffff 55%,#eefaf5);border:1px solid #dce6f2;box-shadow:0 7px 25px rgba(16,24,40,.07)}
-.hero-row{display:flex;align-items:center;gap:16px}.logo{width:64px;height:64px;border-radius:16px;box-shadow:0 4px 12px rgba(0,0,0,.08)}
-.hero h1{margin:0;font-size:2.25rem;letter-spacing:-.03em}.hero p{margin:.35rem 0 0;color:#536273}.version{font-size:.72rem;color:#718096;margin-top:.55rem}
-.card{padding:1rem 1.1rem;border:1px solid #e5e9ef;border-radius:16px;background:#fff;box-shadow:0 3px 14px rgba(16,24,40,.04);height:100%}
-.step{font-weight:800;color:#17365D}.small{font-size:.78rem;color:#718096}
-</style>
-""",unsafe_allow_html=True)
-
-logo_svg='''<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128"><defs><linearGradient id="g" x1="0" x2="1"><stop stop-color="#17365D"/><stop offset="1" stop-color="#2F80ED"/></linearGradient></defs><rect width="128" height="128" rx="28" fill="url(#g)"/><rect x="22" y="70" width="16" height="32" rx="5" fill="#fff"/><rect x="47" y="52" width="16" height="50" rx="5" fill="#fff"/><rect x="72" y="35" width="16" height="67" rx="5" fill="#fff"/><path d="M22 106h76" stroke="#9FE3C4" stroke-width="7" stroke-linecap="round"/><circle cx="99" cy="29" r="10" fill="#9FE3C4"/></svg>'''
-import base64
-logo_b64=base64.b64encode(logo_svg.encode()).decode()
-
-st.markdown(f'''<div class="hero"><div class="hero-row"><img class="logo" src="data:image/svg+xml;base64,{logo_b64}"><div><h1>📊 Monitor COI – SDM Bogotá</h1><p>Analiza el COI completo, descubre todas las empresas y contratos, filtra múltiples opciones y conserva la trazabilidad al PDF original.</p><div class="version">Versión {APP_VERSION} · {APP_NAME} · Secretaría Distrital de Movilidad</div></div></div></div>''',unsafe_allow_html=True)
+st.markdown(f'''<div class="hero"><h1>📊 {APP_NAME} · Secretaría Distrital de Movilidad</h1><p>Analiza el COI completo, valida la extracción y genera listas por empresas, contratos, estados y horarios.</p><div class="small">Versión {APP_VERSION} · extracción por celdas dinámicas del formato oficial COI</div></div>''',unsafe_allow_html=True)
 
 with st.sidebar:
-    st.markdown("### 📄 Flujo de trabajo")
-    st.markdown("**1.** Carga el COI  →  **2.** Analiza  →  **3.** Filtra y genera la lista")
-    st.divider()
-    st.markdown("### ℹ️ Sobre esta versión")
-    st.caption(f"v{APP_VERSION} · Extracción del COI completo. Las empresas y contratos se obtienen directamente del archivo cargado; no hay empresas preconfiguradas obligatorias.")
-    st.divider()
-    st.markdown("[🌐 Portal oficial PMT de SDM](https://www.movilidadbogota.gov.co/pmt)")
+    st.markdown('### ⚙️ Flujo de trabajo')
+    st.write('1️⃣ Carga el PDF')
+    st.write('2️⃣ Analiza el COI')
+    st.write('3️⃣ Filtra empresas y contratos')
+    st.write('4️⃣ Genera la lista')
+    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 10.0</div>',unsafe_allow_html=True)
 
-pdf_file=st.file_uploader("📥 CARGA 1 · Selecciona el COI oficial en PDF",type=["pdf"])
-if not pdf_file:
-    c1,c2,c3=st.columns(3)
-    for c,title,txt in [(c1,"🔍 Analiza","Extrae todos los registros, empresas, contratos, horarios, estados y localidades."),(c2,"🎛️ Filtra","Selecciona una o varias empresas, contratos, estados, localidades o usa búsqueda libre."),(c3,"📊 Resume","Dashboard + Excel con resumen por empresa, contrato, estado, horario y 24 HORAS.")]:
-        with c: st.markdown(f"<div class='card'><div class='step'>{title}</div><p>{txt}</p></div>",unsafe_allow_html=True)
-    st.info("Carga un COI para habilitar el análisis.")
-    st.stop()
+uploaded=st.file_uploader('📥 CARGA 1 · Selecciona el COI oficial en PDF',type=['pdf'])
+if uploaded:
+    data=uploaded.getvalue(); st.caption(f'Archivo: **{uploaded.name}** · {len(data)/1024/1024:.1f} MB')
+    if st.button('🔎 ANALIZAR COI',type='primary',use_container_width=True):
+        with st.spinner('Analizando las celdas del COI...'):
+            df,diag=extract_pdf(data)
+        st.session_state['coi_df']=df; st.session_state['coi_data']=data; st.session_state['coi_name']=uploaded.name; st.session_state['diag']=diag
+        st.session_state['generated']=True
+        st.rerun()
 
-file_key=f"{pdf_file.name}:{len(pdf_file.getvalue())}"
-if st.session_state.get("file_key")!=file_key:
-    st.session_state.file_key=file_key
-    st.session_state.analysis=None
-    st.session_state.generated=False
-
-data=pdf_file.getvalue()
-colA,colB=st.columns([1,4])
-with colA:
-    analyze=st.button("🔎 ANALIZAR COI",type="primary",use_container_width=True)
-with colB:
-    st.caption("Primero analiza el archivo. Después aparecerán los filtros y el botón para generar la lista seleccionada.")
-
-if analyze:
-    with st.spinner("Analizando el COI completo y validando las celdas..."):
-        st.session_state.analysis=parse_pdf(data)
-    st.session_state.generated=False
-
-if st.session_state.get("analysis") is None:
-    st.warning("El archivo está cargado, pero todavía no ha sido analizado. Pulsa **🔎 ANALIZAR COI**.")
-    st.stop()
-
-doc,all_df,pages_scanned,fallback_pages=st.session_state.analysis
-if all_df.empty:
-    st.error("No se encontraron filas válidas del formato COI en el PDF.")
-    st.stop()
-
-st.markdown(f"<div class='small'>📄 <b>{pdf_file.name}</b> · {len(all_df):,} registros extraídos · {pages_scanned} páginas con datos · {fallback_pages} páginas resueltas con método de respaldo</div>",unsafe_allow_html=True)
-
-st.markdown("### 🎛️ CARGA 2 · Selecciona lo que quieres incluir en la lista")
-base=all_df.copy()
-
-c1,c2=st.columns(2)
-with c1:
-    companies=sorted([x for x in base["CONTRATISTA"].dropna().unique() if str(x).strip()])
-    company_filter=st.multiselect("🏢 Empresas / contratistas",companies,help="Puedes seleccionar una, varias o dejar vacío para todas.")
-with c2:
-    contracts=sorted([x for x in base["No. CONTRATO"].dropna().unique() if str(x).strip()])
-    contract_filter=st.multiselect("📑 No. CONTRATO",contracts,help="Puedes seleccionar uno, varios o dejar vacío para todos.")
-c3,c4,c5=st.columns([1,1,1])
-with c3:
-    statuses=sorted(base["ESTADO INTERPRETADO"].dropna().unique())
-    status_filter=st.multiselect("Estado",statuses,default=statuses)
-with c4:
-    localities=sorted([x for x in base["LOCALIDAD"].dropna().unique() if str(x).strip()])
-    locality_filter=st.multiselect("Localidad",localities)
-with c5:
-    sections=sorted([x for x in base["SECCIÓN"].dropna().unique() if str(x).strip()])
-    section_filter=st.multiselect("Sección",sections)
-q=st.text_input("🔍 Búsqueda libre",placeholder="CIV, dirección, contrato, radicado, ingeniero, observación…")
-
-if st.button("⚡ GENERAR LISTA SELECCIONADA",type="primary",use_container_width=True):
-    df=base.copy()
-    if company_filter: df=df[df["CONTRATISTA"].isin(company_filter)]
-    if contract_filter: df=df[df["No. CONTRATO"].isin(contract_filter)]
-    if status_filter: df=df[df["ESTADO INTERPRETADO"].isin(status_filter)]
-    if locality_filter: df=df[df["LOCALIDAD"].isin(locality_filter)]
-    if section_filter: df=df[df["SECCIÓN"].isin(section_filter)]
-    if q.strip():
-        nq=norm(q); mask=df.apply(lambda r:nq in norm(" ".join(str(r.get(c,"")) for c in COLS+ANALYSIS_COLS)),axis=1); df=df[mask]
-    st.session_state.generated_df=df
-    st.session_state.generated=True
-
-if not st.session_state.get("generated",False):
-    st.info("Selecciona los filtros que quieras y pulsa **⚡ GENERAR LISTA SELECCIONADA**. Si dejas empresas y contratos vacíos, podrás generar la lista de todo el COI.")
-    st.stop()
-
-df=st.session_state.generated_df
-if df.empty:
-    st.warning("No hay registros con la combinación de filtros seleccionada.")
-    st.stop()
-
-# KPIs
-h24=df["HORARIO DE TRABAJO"].map(norm)=="24 HORAS"
-k=st.columns(7)
-vals=[("📄 Registros",len(df)),("🟢 Autorizados",int((df["ESTADO INTERPRETADO"]=="AUTORIZADO").sum())),("🔴 No autorizados",int((df["ESTADO INTERPRETADO"]=="NO AUTORIZADO").sum())),("🟠 Emergencias",int((df["ESTADO INTERPRETADO"]=="FORMALIZACIÓN DE EMERGENCIA").sum())),("🕐 24 HORAS",int(h24.sum())),("🏢 Empresas",df["CONTRATISTA"].nunique()),("📑 Contratos",df["No. CONTRATO"].nunique())]
-for c,(lab,val) in zip(k,vals): c.metric(lab,val)
-
-st.success(f"Lista generada: **{len(df):,} registros** de **{df['CONTRATISTA'].nunique():,} empresas** y **{df['No. CONTRATO'].nunique():,} contratos**.")
-t1,t2,t3,t4=st.tabs(["📊 Dashboard","📋 Lista COI","🔎 Trazabilidad","📥 Excel y PDF"])
-with t1:
-    c1,c2=st.columns(2)
-    sc=df["ESTADO INTERPRETADO"].value_counts().rename_axis("Estado").reset_index(name="Cantidad")
-    with c1:
-        st.markdown("#### Estado")
-        fig=px.pie(sc,names="Estado",values="Cantidad",hole=.58); fig.update_layout(height=360,margin=dict(l=10,r=10,t=10,b=10),legend_title_text=""); st.plotly_chart(fig,use_container_width=True)
-    with c2:
-        st.markdown("#### Registros por empresa")
-        cc=df["CONTRATISTA"].value_counts().head(20).rename_axis("Contratista").reset_index(name="Cantidad"); fig=px.bar(cc,y="Contratista",x="Cantidad",orientation="h",text="Cantidad"); fig.update_layout(height=360,margin=dict(l=10,r=10,t=10,b=20),yaxis_title="",xaxis_title="Registros"); st.plotly_chart(fig,use_container_width=True)
-    c3,c4=st.columns(2)
-    with c3:
-        st.markdown("#### Contratos")
-        ct=df["No. CONTRATO"].value_counts().head(20).rename_axis("Contrato").reset_index(name="Cantidad"); fig=px.bar(ct,x="Contrato",y="Cantidad",text="Cantidad"); fig.update_layout(height=390,margin=dict(l=10,r=10,t=10,b=100),xaxis_title="",yaxis_title="Registros",xaxis_tickangle=-45); st.plotly_chart(fig,use_container_width=True)
-    with c4:
-        st.markdown("#### Localidades")
-        lc=df["LOCALIDAD"].replace("","SIN DATO").value_counts().head(20).rename_axis("Localidad").reset_index(name="Cantidad"); fig=px.bar(lc,y="Localidad",x="Cantidad",orientation="h",text="Cantidad"); fig.update_layout(height=390,margin=dict(l=10,r=10,t=10,b=20),yaxis_title="",xaxis_title="Registros"); st.plotly_chart(fig,use_container_width=True)
-    horarios=schedule_analysis(df)
-    c5,c6=st.columns(2)
-    with c5:
-        st.markdown("#### ⏰ Todos los horarios")
-        hp=horarios.head(25); fig=px.bar(hp,y="HORARIO DE TRABAJO",x="REGISTROS",orientation="h",text="REGISTROS"); fig.update_layout(height=470,margin=dict(l=10,r=10,t=10,b=20),yaxis_title="",xaxis_title="Registros"); st.plotly_chart(fig,use_container_width=True)
-    with c6:
-        st.markdown("#### ⏰ Horario vs. estado")
-        long=horarios.head(20).melt(id_vars="HORARIO DE TRABAJO",value_vars=["AUTORIZADOS","NO_AUTORIZADOS","EMERGENCIAS"],var_name="Estado",value_name="Cantidad"); fig=px.bar(long,x="HORARIO DE TRABAJO",y="Cantidad",color="Estado",barmode="group",text="Cantidad"); fig.update_layout(height=470,margin=dict(l=10,r=10,t=10,b=110),xaxis_title="",yaxis_title="Registros",xaxis_tickangle=-45); st.plotly_chart(fig,use_container_width=True)
-    st.markdown("#### 🕐 Resumen 24 HORAS")
-    h24a=int((h24&(df["ESTADO INTERPRETADO"]=="AUTORIZADO")).sum())
-    a,b,c=st.columns(3); a.metric("Registros 24 HORAS",int(h24.sum())); b.metric("24 HORAS autorizados",h24a); c.metric("24 HORAS no autorizados",int(h24.sum())-h24a)
-    st.dataframe(horarios,use_container_width=True,hide_index=True)
-    st.markdown("#### 🏢 Resumen por todas las empresas")
-    st.dataframe(company_summary(df),use_container_width=True,hide_index=True)
-
-with t2:
-    show_extra=st.checkbox("Mostrar campos de análisis",False)
-    cols=COLS+ANALYSIS_COLS if show_extra else COLS
-    st.dataframe(df[cols],use_container_width=True,hide_index=True,height=680,column_config={"OBSERVACIONES":st.column_config.TextColumn(width="large"),"CONTRATISTA":st.column_config.TextColumn(width="medium"),"DIRECCIÓN DE LA OBRA INICIO":st.column_config.TextColumn(width="medium"),"DIRECCIÓN DE LA OBRA FIN":st.column_config.TextColumn(width="medium")})
-
-with t3:
-    options=df["No."].astype(str).tolist(); selected=st.selectbox("Seleccione un No. del COI",options)
-    r=df[df["No."].astype(str)==selected].iloc[0]
-    a,b,c,d=st.columns(4); a.write(f"**Contratista:** {r['CONTRATISTA']}"); b.write(f"**Contrato:** {r['No. CONTRATO']}"); c.write(f"**Página COI:** {r['PÁGINA COI']}"); d.write(f"**Página PDF:** {r['PÁGINA PDF']}")
-    st.write(f"**CIV:** `{r['CIV INICIO']}` → `{r['CIV FIN']}`")
-    st.write(f"**Dirección:** {r['DIRECCIÓN DE LA OBRA INICIO']} → {r['DIRECCIÓN DE LA OBRA FIN']}")
-    st.write(f"**Horario:** {r['HORARIO DE TRABAJO']} · **Estado:** {r['ESTADO INTERPRETADO']} · **Localidad:** {r['LOCALIDAD']}")
-    st.write(f"**Observaciones:** {r['OBSERVACIONES']}")
-    st.download_button("📄 Descargar página original",filtered_pdf(doc,[int(r['PÁGINA PDF'])]),file_name=f"COI_pagina_{int(r['PÁGINA PDF'])}.pdf",mime="application/pdf")
-
-with t4:
-    excel=make_excel(df,pdf_file.name)
-    st.download_button("📊 DESCARGAR EXCEL COMPLETO + RESUMEN",excel,file_name="Monitor_COI_resultados.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
-    st.markdown("#### 📕 PDF por empresa seleccionada")
-    if company_filter:
-        for company in company_filter:
-            cdf=df[df["CONTRATISTA"]==company]
-            if cdf.empty: continue
-            pages=sorted(cdf["PÁGINA PDF"].unique().tolist()); safe=re.sub(r"[^A-Za-z0-9]+","_",company).strip("_")
-            st.download_button(f"📕 {company} · {len(pages)} páginas",filtered_pdf(doc,pages),file_name=f"{safe}_COI.pdf",mime="application/pdf",key=f"pdf_{safe}",use_container_width=True)
-    else: st.caption("Para generar un PDF por empresa, selecciona una o varias empresas arriba y vuelve a generar la lista.")
-
-st.divider(); st.caption(f"Monitor COI · SDM Bogotá · versión {APP_VERSION} · {pdf_file.name} · extracción del COI completo y trazabilidad al documento original.")
+if 'coi_df' not in st.session_state: st.info('Carga el PDF y pulsa **ANALIZAR COI**. La aplicación no procesará el documento antes de ese botón.')
+else:
+    df=st.session_state['coi_df'].copy(); data=st.session_state['coi_data']
+    st.success(f"✅ {st.session_state['coi_name']} · **{len(df):,} registros extraídos** · {sum(n>0 for _,n in st.session_state['diag']):,} páginas con datos")
+    if len(df):
+        companies=sorted([x for x in df['CONTRATISTA'].dropna().unique() if clean(x)],key=lambda x:x.upper())
+        contracts=sorted([x for x in df['CONTRATO CANÓNICO'].dropna().unique() if clean(x)])
+        states=sorted(df['ESTADO INTERPRETADO'].dropna().unique())
+        localities=sorted([x for x in df['LOCALIDAD'].dropna().unique() if clean(x)])
+        sections=sorted([x for x in df['SECCIÓN'].dropna().unique() if clean(x)])
+        st.markdown('### 🎛️ CARGA 2 · Selecciona lo que quieres incluir en la lista')
+        c1,c2=st.columns(2)
+        with c1: sel_comp=st.multiselect('🏢 Empresas / contratistas',companies,placeholder='Selecciona una o varias')
+        with c2: sel_con=st.multiselect('📄 No. CONTRATO',contracts,placeholder='Selecciona uno o varios')
+        c3,c4,c5=st.columns(3)
+        with c3: sel_state=st.multiselect('Estado',states,default=states)
+        with c4: sel_loc=st.multiselect('Localidad',localities)
+        with c5: sel_sec=st.multiselect('Sección',sections)
+        q=st.text_input('🔎 Búsqueda libre','',placeholder='CIV, dirección, contrato, radicado, ingeniero, observación...')
+        mask=pd.Series(True,index=df.index)
+        if sel_comp: mask &= df['CONTRATISTA'].isin(sel_comp)
+        if sel_con: mask &= df['CONTRATO CANÓNICO'].isin(sel_con)
+        if sel_state: mask &= df['ESTADO INTERPRETADO'].isin(sel_state)
+        if sel_loc: mask &= df['LOCALIDAD'].isin(sel_loc)
+        if sel_sec: mask &= df['SECCIÓN'].isin(sel_sec)
+        if q:
+            qq=norm(q); mask &= df[COLS].astype(str).apply(lambda col: col.map(norm).str.contains(qq,regex=False)).any(axis=1)
+        candidate=df[mask].copy()
+        if st.button('⚡ GENERAR LISTA SELECCIONADA',type='primary',use_container_width=True): st.session_state['filtered']=candidate
+        result=st.session_state.get('filtered',candidate)
+        if not result.empty:
+            a,b,c,d,e,f,g=st.columns(7)
+            vals=[len(result),int((result['ESTADO INTERPRETADO']=='AUTORIZADO').sum()),int((result['ESTADO INTERPRETADO']=='NO AUTORIZADO').sum()),int((result['ESTADO INTERPRETADO']=='FORMALIZACIÓN DE EMERGENCIA').sum()),int(result['HORARIO DE TRABAJO'].map(norm).eq('24HORAS').sum()),result['CONTRATISTA'].nunique(),result['CONTRATO CANÓNICO'].nunique()]
+            labs=['📄 Registros','🟢 Autorizados','🔴 No autorizados','🟠 Emergencias','🕘 24 HORAS','🏢 Empresas','📑 Contratos']
+            for col,lab,val in zip([a,b,c,d,e,f,g],labs,vals): col.metric(lab,f'{val:,}')
+            st.success(f"Lista generada: **{len(result):,} registros** · {result['CONTRATISTA'].nunique()} empresas · {result['CONTRATO CANÓNICO'].nunique()} contratos")
+            tab1,tab2,tab3,tab4=st.tabs(['📊 Dashboard','📋 Lista COI','🔍 Trazabilidad','📥 Excel y PDF'])
+            with tab1:
+                st.subheader('Resumen del resultado seleccionado')
+                r1,r2=st.columns(2)
+                state_counts=result['ESTADO INTERPRETADO'].value_counts().reset_index(); state_counts.columns=['Estado','Cantidad']
+                with r1: st.plotly_chart(px.pie(state_counts,names='Estado',values='Cantidad',hole=.45,title='Estado de los registros'),use_container_width=True)
+                comp_counts=result['CONTRATISTA'].value_counts().head(20).reset_index(); comp_counts.columns=['Contratista','Cantidad']
+                with r2: st.plotly_chart(px.bar(comp_counts,y='Contratista',x='Cantidad',orientation='h',title='Registros por empresa'),use_container_width=True)
+                hcounts=result['HORARIO DE TRABAJO'].value_counts().reset_index(); hcounts.columns=['Horario','Cantidad']
+                st.plotly_chart(px.bar(hcounts,x='Horario',y='Cantidad',title='Registros por horario'),use_container_width=True)
+                cross=pd.crosstab(result['HORARIO DE TRABAJO'],result['ESTADO INTERPRETADO']).reset_index()
+                st.plotly_chart(px.bar(cross,x='HORARIO DE TRABAJO',y=[c for c in cross.columns if c!='HORARIO DE TRABAJO'],title='Horario vs. estado'),use_container_width=True)
+            with tab2:
+                st.dataframe(result[COLS+['PÁGINA PDF','SECCIÓN','CONTRATO CANÓNICO','ESTADO INTERPRETADO']],use_container_width=True,height=520,hide_index=True)
+            with tab3:
+                nums=result['No.'].astype(str).tolist(); chosen=st.selectbox('Selecciona un No. del COI',nums)
+                rr=result[result['No.'].astype(str)==chosen].iloc[0]
+                st.write({k:rr[k] for k in ['No.','CIV INICIO','CIV FIN','DIRECCIÓN DE LA OBRA INICIO','DIRECCIÓN DE LA OBRA FIN','CONTRATISTA','No. CONTRATO','HORARIO DE TRABAJO','HORARIO DE CIERRE','AUTORIZADO','LOCALIDAD','PÁGINA PDF']})
+                st.download_button('📄 Descargar página original del PDF',pdf_pages(data,[int(rr['PÁGINA PDF'])]),file_name=f'COI_pagina_{int(rr["PÁGINA PDF"])}.pdf',mime='application/pdf')
+            with tab4:
+                st.download_button('📊 Descargar Excel completo filtrado',make_excel(result),file_name='Monitor_COI_resultado.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                pages=pdf_pages(data,result['PÁGINA PDF'].astype(int).tolist()); st.download_button('📄 Descargar PDF con páginas originales',pages,file_name='Monitor_COI_paginas_seleccionadas.pdf',mime='application/pdf')
+                hor=result.groupby('HORARIO DE TRABAJO').agg(REGISTROS=('No.','count'),AUTORIZADOS=('ESTADO INTERPRETADO',lambda s:(s=='AUTORIZADO').sum()),NO_AUTORIZADOS=('ESTADO INTERPRETADO',lambda s:(s=='NO AUTORIZADO').sum()),EMERGENCIAS=('ESTADO INTERPRETADO',lambda s:(s=='FORMALIZACIÓN DE EMERGENCIA').sum())).reset_index().sort_values('REGISTROS',ascending=False)
+                st.dataframe(hor,use_container_width=True,hide_index=True)
+        else: st.warning('No hay registros que cumplan los filtros seleccionados.')
