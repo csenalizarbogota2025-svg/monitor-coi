@@ -129,10 +129,24 @@ def field_text(words, left, right):
     return clean(" ".join(w[4] for w in vals))
 
 
+def clean_cell(v):
+    if v is None:
+        return ""
+    return clean(str(v).replace("\n", " "))
+
+
 def parse_pdf(data):
+    """Extrae las filas usando las celdas reales de la tabla PDF.
+
+    A diferencia de una extracción por coordenadas fijas, find_tables() respeta
+    las líneas verticales de cada página. Esto evita que nombres largos de
+    direcciones/ingenieros terminen dentro de CIV INICIO o CIV FIN.
+    """
     doc = fitz.open(stream=data, filetype="pdf")
     records = []
     pages_scanned = 0
+    seen = set()
+
     for pidx, page in enumerate(doc):
         text = page.get_text("text")
         ntext = norm(text)
@@ -140,38 +154,108 @@ def parse_pdf(data):
             continue
         if "CONTRATISTA" not in ntext or "NO CONTRATO" not in ntext:
             continue
-        starts = row_starts(page)
-        if not starts:
-            continue
-        pages_scanned += 1
+
+        try:
+            tables = page.find_tables().tables
+        except Exception:
+            tables = []
+
+        page_found = False
         printed_page = get_printed_page(text, pidx + 1)
         section = get_section(text)
-        for i, (y_start, row_no) in enumerate(starts):
-            top = max(300, y_start - 3)
-            bottom = starts[i + 1][0] - 3 if i + 1 < len(starts) else page.rect.height - 55
-            if bottom <= top:
+
+        for table in tables:
+            try:
+                rows = table.extract()
+            except Exception:
                 continue
-            words = words_in_interval(page, top, bottom)
-            if not words:
-                continue
-            row = {col: field_text(words, X[j], X[j + 1]) for j, col in enumerate(COLS)}
-            row["No."] = row_no
-            contractor, contract = clean(row["CONTRATISTA"]), clean(row["No. CONTRATO"])
-            company, method, validation = identify_company(contractor, contract)
-            row["EMPRESA CONFIGURADA"] = company or "No configurada"
-            row["IDENTIFICACIÓN CONFIGURADA"] = validation
-            row["MÉTODO IDENTIFICACIÓN"] = method
-            row["ESTADO INTERPRETADO"] = classify(row)
-            row["PÁGINA PDF"] = pidx + 1
-            row["PÁGINA COI"] = printed_page
-            row["SECCIÓN"] = section
-            row["CONTRATO CANÓNICO"] = canonical_contract(contract)
-            row["CONTRATO ESPERADO"] = COMPANIES[company]["contract"] if company else ""
-            row["CONTRATO VALIDADO"] = "SÍ" if company and (COMPANIES[company]["contract"] is None or canonical_contract(contract) == canonical_contract(COMPANIES[company]["contract"])) else "NO"
-            records.append(row)
+
+            for raw in rows:
+                if not raw or len(raw) < 16:
+                    continue
+                # La tabla oficial tiene 16 columnas; ignoramos encabezados y
+                # filas de títulos. El No. del COI es numérico.
+                first = clean_cell(raw[0])
+                if not re.fullmatch(r"\d{4,7}", first):
+                    continue
+
+                vals = [clean_cell(raw[i]) if i < len(raw) else "" for i in range(16)]
+                key = (pidx + 1, first, vals[1], vals[2], vals[5], vals[10])
+                if key in seen:
+                    continue
+                seen.add(key)
+                row = dict(zip(COLS, vals))
+                row["No."] = first
+
+                contractor = row["CONTRATISTA"]
+                contract = row["No. CONTRATO"]
+                company, method, validation = identify_company(contractor, contract)
+                row["EMPRESA CONFIGURADA"] = company or "No configurada"
+                row["IDENTIFICACIÓN CONFIGURADA"] = validation
+                row["MÉTODO IDENTIFICACIÓN"] = method
+                row["ESTADO INTERPRETADO"] = classify(row)
+                row["PÁGINA PDF"] = pidx + 1
+                row["PÁGINA COI"] = printed_page
+                row["SECCIÓN"] = section
+                row["CONTRATO CANÓNICO"] = canonical_contract(contract)
+                row["CONTRATO ESPERADO"] = COMPANIES[company]["contract"] if company else ""
+                row["CONTRATO VALIDADO"] = "SÍ" if company and (COMPANIES[company]["contract"] is None or canonical_contract(contract) == canonical_contract(COMPANIES[company]["contract"])) else "NO"
+                records.append(row)
+                page_found = True
+
+        if page_found:
+            pages_scanned += 1
+
     extra = ["EMPRESA CONFIGURADA", "IDENTIFICACIÓN CONFIGURADA", "MÉTODO IDENTIFICACIÓN", "ESTADO INTERPRETADO", "PÁGINA PDF", "PÁGINA COI", "SECCIÓN", "CONTRATO CANÓNICO", "CONTRATO ESPERADO", "CONTRATO VALIDADO"]
     return doc, pd.DataFrame(records, columns=COLS + extra), pages_scanned
 
+
+def schedule_analysis(df):
+    """Resumen de horarios de trabajo y su cruce con autorización."""
+    if df.empty:
+        return pd.DataFrame(columns=["HORARIO DE TRABAJO", "REGISTROS", "AUTORIZADOS", "NO AUTORIZADOS", "EMERGENCIAS"])
+    tmp = df.copy()
+    tmp["HORARIO DE TRABAJO"] = tmp["HORARIO DE TRABAJO"].fillna("").map(clean)
+    tmp["HORARIO NORMALIZADO"] = tmp["HORARIO DE TRABAJO"].map(norm).replace("", "SIN DATO")
+    out = tmp.groupby("HORARIO NORMALIZADO").agg(
+        REGISTROS=("No.", "size"),
+        AUTORIZADOS=("ESTADO INTERPRETADO", lambda s: int((s == "AUTORIZADO").sum())),
+        NO_AUTORIZADOS=("ESTADO INTERPRETADO", lambda s: int((s == "NO AUTORIZADO").sum())),
+        EMERGENCIAS=("ESTADO INTERPRETADO", lambda s: int((s == "FORMALIZACIÓN DE EMERGENCIA").sum())),
+    ).reset_index()
+    out = out.rename(columns={"HORARIO NORMALIZADO": "HORARIO DE TRABAJO"}).sort_values(["REGISTROS", "HORARIO DE TRABAJO"], ascending=[False, True])
+    return out
+
+
+def make_excel(df):
+    out = io.BytesIO()
+    horarios = schedule_analysis(df)
+    resumen = pd.DataFrame({
+        "INDICADOR": [
+            "Registros", "Autorizados", "No autorizados", "Formalización de emergencia",
+            "Otros estados", "Contratistas", "Contratos", "Registros con horario 24 HORAS",
+            "Autorizados con horario 24 HORAS"
+        ],
+        "VALOR": [
+            len(df),
+            int((df["ESTADO INTERPRETADO"] == "AUTORIZADO").sum()),
+            int((df["ESTADO INTERPRETADO"] == "NO AUTORIZADO").sum()),
+            int((df["ESTADO INTERPRETADO"] == "FORMALIZACIÓN DE EMERGENCIA").sum()),
+            int((df["ESTADO INTERPRETADO"] == "OTRO").sum()),
+            df["CONTRATISTA"].nunique(),
+            df["No. CONTRATO"].nunique(),
+            int((df["HORARIO DE TRABAJO"].map(norm) == "24 HORAS").sum()),
+            int(((df["HORARIO DE TRABAJO"].map(norm) == "24 HORAS") & (df["ESTADO INTERPRETADO"] == "AUTORIZADO")).sum()),
+        ]
+    })
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="COI completo")
+        resumen.to_excel(writer, index=False, sheet_name="Resumen")
+        df.groupby(["ESTADO INTERPRETADO"]).size().reset_index(name="Registros").to_excel(writer, index=False, sheet_name="Estados")
+        horarios.to_excel(writer, index=False, sheet_name="Horarios")
+        df.groupby(["CONTRATISTA", "No. CONTRATO"]).size().reset_index(name="Registros").sort_values("Registros", ascending=False).to_excel(writer, index=False, sheet_name="Empresas y contratos")
+        df.groupby("LOCALIDAD").size().reset_index(name="Registros").sort_values("Registros", ascending=False).to_excel(writer, index=False, sheet_name="Localidades")
+    return out.getvalue()
 
 def filtered_pdf(doc, pages):
     out = fitz.open()
@@ -332,6 +416,27 @@ with tab1:
         fig=px.bar(lc,y="Localidad",x="Cantidad",orientation="h",text="Cantidad")
         fig.update_layout(height=390,margin=dict(l=10,r=10,t=10,b=20),yaxis_title="",xaxis_title="Registros")
         st.plotly_chart(fig,use_container_width=True)
+    c5, c6 = st.columns(2)
+    horarios = schedule_analysis(df)
+    with c5:
+        st.markdown("#### ⏰ Registros por horario de trabajo")
+        hplot = horarios.head(20).copy()
+        fig = px.bar(hplot, y="HORARIO DE TRABAJO", x="REGISTROS", orientation="h", text="REGISTROS")
+        fig.update_layout(height=430, margin=dict(l=10,r=10,t=10,b=20), yaxis_title="", xaxis_title="Registros")
+        st.plotly_chart(fig, use_container_width=True)
+    with c6:
+        st.markdown("#### 🕐 Horarios aprobados / autorizados")
+        h2 = horarios.head(20).copy()
+        longh = h2.melt(id_vars="HORARIO DE TRABAJO", value_vars=["AUTORIZADOS","NO_AUTORIZADOS","EMERGENCIAS"], var_name="Estado", value_name="Cantidad")
+        fig = px.bar(longh, x="HORARIO DE TRABAJO", y="Cantidad", color="Estado", barmode="group", text="Cantidad")
+        fig.update_layout(height=430, margin=dict(l=10,r=10,t=10,b=100), xaxis_title="", yaxis_title="Registros", xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+
+    h24 = int((df["HORARIO DE TRABAJO"].map(norm) == "24 HORAS").sum())
+    h24_auth = int(((df["HORARIO DE TRABAJO"].map(norm) == "24 HORAS") & (df["ESTADO INTERPRETADO"] == "AUTORIZADO")).sum())
+    st.info(f"**Análisis 24 HORAS:** {h24:,} registros tienen horario de trabajo 24 HORAS; de ellos, **{h24_auth:,}** están clasificados como AUTORIZADOS.")
+    st.dataframe(horarios, use_container_width=True, hide_index=True)
+
     st.markdown("#### Empresas configuradas encontradas")
     configured=df[df["EMPRESA CONFIGURADA"]!="No configurada"]
     if configured.empty:
@@ -373,6 +478,8 @@ with tab3:
 with tab4:
     st.markdown("### 📊 Excel del COI filtrado")
     st.download_button("⬇️ Descargar Excel con registros + análisis",make_excel(df),file_name="Monitor_COI_resultados.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+    st.markdown("### ⏰ Resumen de horarios")
+    st.dataframe(schedule_analysis(df), use_container_width=True, hide_index=True)
     st.divider(); st.markdown("### 📕 PDF por contratista seleccionado")
     if contractor_filter:
         for contractor in contractor_filter:
@@ -385,4 +492,4 @@ with tab4:
         st.info("Selecciona uno o varios contratistas en el filtro para habilitar su PDF.")
 
 st.divider()
-st.caption("Monitor COI – SDM Bogotá | v5.0 — extracción del COI completo, filtros por cualquier contratista/contrato, validación de empresas configuradas y trazabilidad por página.")
+st.caption("Monitor COI – SDM Bogotá | v7.0 — extracción del COI completo, filtros por cualquier contratista/contrato, validación de empresas configuradas y trazabilidad por página.")
