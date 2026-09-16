@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "processed_at_utc": "2026-09-16T17:46:13Z",
+  "coi_number": 37,
+  "coi_date": "2026-09-10",
+  "source_url": "https://www.movilidadbogota.gov.co/sites/default/files/2026-09-10/coi_37_%282026_09_10%29.pdf",
+  "source_label": "COI_37_(2026_09_10)",
+  "pdf_pages": 377,
+  "records_extracted": 895,
+  "companies": 110,
+  "contracts": 83,
+  "authorized": 812,
+  "not_authorized": 47,
+  "emergencies": 36,
+  "24_hours": 305,
+  "email_to": "kevintkd01@gmail.com"
+}
