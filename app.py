@@ -4,11 +4,12 @@ import fitz
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import requests
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-APP_VERSION='11.3'
+APP_VERSION='12.0'
 APP_NAME='Monitor COI'
 COLS=['No.','CIV INICIO','CIV FIN','DIRECCIÓN DE LA OBRA INICIO','DIRECCIÓN DE LA OBRA FIN','CONTRATISTA','FECHA INICIO','FECHA FIN','HORARIO DE TRABAJO','HORARIO DE CIERRE','No. CONTRATO','OBSERVACIONES','AUTORIZADO','LOCALIDAD','ING. RESPONSABLE','No RADICADO SDM']
 
@@ -331,7 +332,7 @@ with st.sidebar:
     st.write('2️⃣ Analiza el COI')
     st.write('3️⃣ Filtra empresas y contratos')
     st.write('4️⃣ Genera la lista')
-    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 11.3</div>',unsafe_allow_html=True)
+    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 12.0</div>',unsafe_allow_html=True)
 
 uploaded=st.file_uploader('📥 CARGA 1 · Selecciona el COI oficial en PDF',type=['pdf'])
 if uploaded:
@@ -406,7 +407,7 @@ else:
             labs=['📄 Registros','🟢 Autorizados','🔴 No autorizados','🟠 Emergencias','🕘 24 HORAS','🏢 Empresas','📑 Contratos']
             for col,lab,val in zip([a,b,c,d,e,f,g],labs,vals): col.metric(lab,f'{val:,}')
             st.success(f"Lista generada: **{len(result):,} registros** · {result['CONTRATISTA'].nunique()} empresas · {result['CONTRATO CANÓNICO'].nunique()} contratos")
-            tab1,tab2,tab3,tab4=st.tabs(['📊 Dashboard','📋 Lista COI','🔍 Trazabilidad','📥 Excel y PDF'])
+            tab1,tab2,tab3,tab4,tab5=st.tabs(['📊 Dashboard','📋 Lista COI','🔍 Trazabilidad','📥 Excel y PDF','🤖 Automático'])
             with tab1:
                 st.subheader('Resumen del resultado seleccionado')
                 r1,r2=st.columns(2)
@@ -430,4 +431,24 @@ else:
                 pages=pdf_pages(data,result['PÁGINA PDF'].astype(int).tolist()); st.download_button('📄 Descargar PDF con páginas originales',pages,file_name='Monitor_COI_paginas_seleccionadas.pdf',mime='application/pdf')
                 hor=result.groupby('HORARIO DE TRABAJO').agg(REGISTROS=('No.','count'),AUTORIZADOS=('ESTADO INTERPRETADO',lambda s:(s=='AUTORIZADO').sum()),NO_AUTORIZADOS=('ESTADO INTERPRETADO',lambda s:(s=='NO AUTORIZADO').sum()),EMERGENCIAS=('ESTADO INTERPRETADO',lambda s:(s=='FORMALIZACIÓN DE EMERGENCIA').sum())).reset_index().sort_values('REGISTROS',ascending=False)
                 st.dataframe(hor,use_container_width=True,hide_index=True)
+            with tab5:
+                st.subheader('🤖 Resultado automático semanal')
+                st.caption('El proceso automático busca el COI más reciente directamente en la página oficial de SDM, lo procesa cada viernes y envía por Gmail el PDF original, el Excel completo y un PDF resumen. No compara con el COI anterior.')
+                status_url='https://raw.githubusercontent.com/csenalizarbogota2025-svg/monitor-coi/main/automatic/status.json'
+                try:
+                    rr=requests.get(status_url,timeout=8)
+                    if rr.ok:
+                        js=rr.json(); a,b,c,d=st.columns(4)
+                        a.metric('Último COI procesado',str(js.get('coi_number','—')))
+                        b.metric('Registros',f"{int(js.get('records_extracted',0)):,}")
+                        c.metric('Empresas',f"{int(js.get('companies',0)):,}")
+                        d.metric('Contratos',f"{int(js.get('contracts',0)):,}")
+                        st.success(f"✅ COI No. {js.get('coi_number','—')} · fecha {js.get('coi_date','—')} · procesado {js.get('processed_at_utc','—')}")
+                        st.write(f"Fuente oficial: {js.get('source_url','')}")
+                        st.write(f"24 HORAS: {int(js.get('24_hours',0)):,} · Autorizados: {int(js.get('authorized',0)):,} · No autorizados: {int(js.get('not_authorized',0)):,} · Emergencias: {int(js.get('emergencies',0)):,}")
+                    else:
+                        st.info('Aún no existe un resultado automático publicado en el historial.')
+                except Exception:
+                    st.info('El historial automático aparecerá aquí después de la primera ejecución de GitHub Actions.')
+                st.markdown('**Programación:** viernes · ejecución automática en GitHub Actions. También existe un botón de ejecución manual para hacer pruebas sin esperar al viernes.')
         else: st.warning('No hay registros que cumplan los filtros seleccionados.')
