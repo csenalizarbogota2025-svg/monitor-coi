@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-APP_VERSION='10.5'
+APP_VERSION='11.0'
 APP_NAME='Monitor COI'
 COLS=['No.','CIV INICIO','CIV FIN','DIRECCIÓN DE LA OBRA INICIO','DIRECCIÓN DE LA OBRA FIN','CONTRATISTA','FECHA INICIO','FECHA FIN','HORARIO DE TRABAJO','HORARIO DE CIERRE','No. CONTRATO','OBSERVACIONES','AUTORIZADO','LOCALIDAD','ING. RESPONSABLE','No RADICADO SDM']
 
@@ -209,50 +209,41 @@ def _row_matches_company_contract(block_norm, company_norm, contract_canon):
     return True
 
 def source_validation(data, df):
-    """Validate contractor+contract counts against robust source row anchors."""
-    catalog=_source_rows_from_text(data)
+    """Screening referencial: cuenta menciones de contratista/contrato en todo el PDF.
+
+    IMPORTANTE: estas son menciones textuales, no filas. Pueden incluir observaciones,
+    encabezados o referencias a terceros. Sirven como control de pantalla para detectar
+    posibles diferencias y dirigir la revisión manual; no se consideran una validación
+    exacta de registros.
+    """
+    doc=fitz.open(stream=data,filetype='pdf')
+    # Normalizamos cada página por separado para conservar trazabilidad básica.
+    page_norms=[norm(p.get_text('text') or '') for p in doc]
+    doc.close()
     grouped=(df.groupby(['CONTRATISTA','CONTRATO CANÓNICO'],dropna=False)
-               .size().reset_index(name='REGISTROS EXTRAÍDOS'))
+               .size().reset_index(name='REGISTROS_EXTRAÍDOS'))
     rows=[]
     for _,r in grouped.iterrows():
         company=clean(r.get('CONTRATISTA',''))
         contract=clean(r.get('CONTRATO CANÓNICO',''))
-        c=norm(company); k=contract_canonical(contract)
-        matched=[x for x in catalog if _row_matches_company_contract(x.get('BLOQUE_NORM',''),c,k)]
-        uniq={(x.get('PÁGINA PDF'),x.get('No.')) for x in matched if x.get('PÁGINA PDF') is not None and x.get('No.')}
-        source_count=len(uniq)
-        extracted=int(r['REGISTROS EXTRAÍDOS'])
-        diff=source_count-extracted
-        rows.append({'CONTRATISTA':company,'CONTRATO CANÓNICO':contract,
-                     'FILAS IDENTIFICADAS EN PDF':source_count,
-                     'REGISTROS EXTRAÍDOS':extracted,'DIFERENCIA':diff,
-                     'VALIDACIÓN':'✅ OK' if diff==0 else '⚠️ REVISAR'})
-    out=pd.DataFrame(rows)
-    return out if out.empty else out.sort_values(['VALIDACIÓN','REGISTROS EXTRAÍDOS'],ascending=[True,False])
-
-def extract_pdf(data, progress=None):
-    doc=fitz.open(stream=data,filetype='pdf')
-    records=[]; page_diag=[]; total=len(doc)
-    for pi,page in enumerate(doc):
-        rows=extract_page(page)
-        txt=page.get_text('text').upper()
-        section='SECCIÓN 1' if 'SECCIÓN 1.' in txt else ('SECCIÓN 2' if 'SECCIÓN 2.' in txt else '')
-        page_diag.append((pi+1,len(rows)))
-        for r in rows:
-            r=r[:16]+['']*max(0,16-len(r))
-            rec=dict(zip(COLS,r[:16])); rec['PÁGINA PDF']=pi+1; rec['SECCIÓN']=section; rec['CONTRATO CANÓNICO']=contract_canonical(rec['No. CONTRATO'])
-            auth=norm(rec['AUTORIZADO']); obs=norm(rec['OBSERVACIONES'])
-            if 'EMERGENCIA' in auth or 'FORMALIZACIONDEEMERGENCIA' in auth: state='FORMALIZACIÓN DE EMERGENCIA'
-            elif auth in ('NO','NOAUTORIZADO','NOAUTORIZADA'): state='NO AUTORIZADO'
-            elif auth in ('SI','SIAUTORIZADO','AUTORIZADO','AUTORIZADOCONOBSERVACIONES') or 'AUTORIZA' in obs: state='AUTORIZADO'
-            else: state=clean(rec['AUTORIZADO']) or 'OTRO'
-            rec['ESTADO INTERPRETADO']=state
-            records.append(rec)
-        if progress is not None:
-            pct=int(((pi+1)/max(total,1))*100)
-            progress.progress(pct, text=f'Analizando página {pi+1:,} de {total:,} · {len(records):,} registros encontrados')
-    doc.close()
-    return pd.DataFrame(records),page_diag
+        c=norm(company)
+        variants=_contract_variants(contract)
+        company_mentions=sum(txt.count(c) for txt in page_norms) if c else 0
+        contract_mentions=sum(sum(txt.count(v) for v in variants) for txt in page_norms) if variants else 0
+        extracted=int(r['REGISTROS_EXTRAÍDOS'])
+        # Mensiones del contratista sirven solo como referencia. Pueden superar los registros
+        # por apariciones en observaciones y pueden ser menores cuando el PDF separa el nombre.
+        diff=company_mentions-extracted
+        rows.append({
+            'CONTRATISTA':company,
+            'CONTRATO CANÓNICO':contract,
+            'MENCIONES CONTRATISTA EN PDF':company_mentions,
+            'MENCIONES CONTRATO EN PDF':contract_mentions,
+            'REGISTROS EXTRAÍDOS':extracted,
+            'DIFERENCIA REFERENCIAL':diff,
+            'VALIDACIÓN':'🔎 REVISAR MANUALMENTE' if diff!=0 else '✅ COINCIDE',
+        })
+    return pd.DataFrame(rows).sort_values(['VALIDACIÓN','REGISTROS_EXTRAÍDOS'],ascending=[True,False]).reset_index(drop=True)
 
 def make_excel(df, validation=None):
     bio=io.BytesIO()
@@ -293,7 +284,7 @@ with st.sidebar:
     st.write('2️⃣ Analiza el COI')
     st.write('3️⃣ Filtra empresas y contratos')
     st.write('4️⃣ Genera la lista')
-    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 10.8</div>',unsafe_allow_html=True)
+    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 11.0</div>',unsafe_allow_html=True)
 
 uploaded=st.file_uploader('📥 CARGA 1 · Selecciona el COI oficial en PDF',type=['pdf'])
 if uploaded:
@@ -305,10 +296,10 @@ if uploaded:
         status.info('⏳ Iniciando extracción página por página...')
         df,diag=extract_pdf(data, progress)
         progress.progress(100, text=f'✅ Análisis terminado · {len(df):,} registros extraídos')
-        status.success('✅ Extracción terminada. Ahora se valida lo extraído frente al texto del PDF...')
+        status.success('✅ Extracción terminada. Ahora se cuentan las menciones de empresas y contratos en el PDF...')
         try:
             validation=source_validation(data, df)
-            status.success('✅ Validación terminada.')
+            status.success('✅ Control de menciones terminado.')
         except Exception as exc:
             validation=pd.DataFrame()
             status.warning(f'⚠️ La extracción terminó, pero la validación no pudo completarse en esta versión. Los registros extraídos se conservan. Detalle técnico: {type(exc).__name__}')
@@ -321,21 +312,21 @@ else:
     df=st.session_state['coi_df'].copy(); data=st.session_state['coi_data']
     st.success(f"✅ {st.session_state['coi_name']} · **{len(df):,} registros extraídos** · {sum(n>0 for _,n in st.session_state['diag']):,} páginas con datos")
     validation=st.session_state.get('validation',pd.DataFrame())
-    with st.expander('✅ Validación de extracción · PDF vs. registros extraídos', expanded=True):
+    with st.expander('🔎 Control de menciones en PDF · referencia para revisión', expanded=True):
         if not validation.empty:
             ok=int((validation['VALIDACIÓN']=='✅ OK').sum())
             rev=int((validation['VALIDACIÓN']=='⚠️ REVISAR').sum())
             m1,m2,m3=st.columns(3)
-            m1.metric('Empresas/contratos validados',f'{len(validation):,}')
-            m2.metric('Coincidencias OK',f'{ok:,}')
-            m3.metric('Revisar',f'{rev:,}')
+            m1.metric('Empresas/contratos revisados',f'{len(validation):,}')
+            m2.metric('Sin diferencia referencial',f'{ok:,}')
+            m3.metric('Para revisión manual',f'{rev:,}')
             st.dataframe(validation,use_container_width=True,hide_index=True)
             if rev:
-                st.warning('Se detectaron diferencias entre las filas identificadas en el PDF y los registros extraídos. Revisa las filas marcadas antes de usar el resultado para control.')
+                st.warning('Este cuadro cuenta menciones textuales en todo el PDF, incluidas posibles menciones en OBSERVACIONES y encabezados. No reemplaza la revisión fila por fila; úsalo como indicador para orientar la revisión.')
             else:
-                st.success('La validación no detectó diferencias en los contratistas/contratos analizados.')
+                st.success('No se detectaron diferencias entre menciones textuales y registros extraídos en los grupos revisados.')
         else:
-            st.info('No se pudo construir la validación para este archivo.')
+            st.info('No se pudo construir el control de menciones para este archivo.')
     if len(df):
         companies=sorted([x for x in df['CONTRATISTA'].dropna().unique() if clean(x)],key=lambda x:x.upper())
         contracts=sorted([x for x in df['CONTRATO CANÓNICO'].dropna().unique() if clean(x)])
