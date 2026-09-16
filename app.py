@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-APP_VERSION = "8.0"
+APP_VERSION = "9.0"
 APP_NAME = "Monitor COI"
 COLS = [
     "No.", "CIV INICIO", "CIV FIN", "DIRECCIÓN DE LA OBRA INICIO", "DIRECCIÓN DE LA OBRA FIN",
@@ -80,75 +80,77 @@ def looks_like_data_row(row):
     return True
 
 def table_boundaries(page):
-    """Obtiene los límites reales de las 16 columnas desde las líneas del PDF.
-    Evita find_tables(), que es mucho más lento y puede fusionar texto de celdas.
-    """
-    interior=[]; outer=[]
+    """Devuelve las 17 líneas verticales de la tabla COI (16 columnas)."""
+    xs=[]
     for dr in page.get_drawings():
         for item in dr.get("items",[]):
             if item[0] == "l":
                 p1,p2=item[1],item[2]
                 if abs(p1.x-p2.x)<1.5 and abs(p2.y-p1.y)>500:
-                    interior.append((p1.x,p1.y,p2.y))
+                    xs.append(float(p1.x))
             elif item[0] == "re":
                 r=item[1]
-                if r.height>500 and r.width<5:
-                    outer.append((r.x0,r.x1))
-    xs=[]
-    for x,_,_ in interior:
-        if not any(abs(x-y)<2 for y in xs): xs.append(x)
-    xs=sorted(xs)
-    left=min((x0 for x0,x1 in outer), default=74.5)
-    right=max((x1 for x0,x1 in outer), default=2008.5)
-    # Remove any accidental outer candidates from interior and build 17 boundaries.
-    xs=[x for x in xs if left+10 < x < right-10]
-    if len(xs)>=15:
-        # The official format has 15 interior verticals.
-        xs=xs[:15]
-    if len(xs)==15:
-        return [left]+xs+[right]
-    return []
+                if r.width<5 and r.height>500:
+                    xs.append(float(r.x0))
+    out=[]
+    for x in sorted(xs):
+        if not out or abs(x-out[-1])>2:
+            out.append(x)
+    return out if len(out)==17 else []
+
+def table_horizontal_lines(page):
+    """Líneas horizontales que delimitan las filas de la tabla COI."""
+    ys=[]
+    for dr in page.get_drawings():
+        for item in dr.get("items",[]):
+            if item[0] == "l":
+                p1,p2=item[1],item[2]
+                if abs(p1.y-p2.y)<1.5 and abs(p2.x-p1.x)>1500:
+                    ys.append(float(p1.y))
+            elif item[0] == "re":
+                r=item[1]
+                if r.height<5 and r.width>1500:
+                    ys.append(float(r.y0))
+    out=[]
+    for y in sorted(ys):
+        if not out or abs(y-out[-1])>2:
+            out.append(y)
+    return out
 
 def extract_rows_from_words(page, xs):
+    """Extrae cada fila dentro de sus límites horizontales reales.
+    A diferencia de agrupar por la posición de la primera palabra, aquí cada
+    fila está delimitada por las líneas horizontales dibujadas en el COI.
+    Esto evita que textos multilínea de dirección/contratista se recorten o
+    se mezclen con la fila siguiente.
+    """
+    if len(xs)!=17:
+        return []
+    ys=table_horizontal_lines(page)
+    if len(ys)<3:
+        return []
     words=page.get_text("words")
-    # First-column numeric words define row starts.
-    starts=[]
-    for w in words:
-        x0,y0,x1,y1,t,*_=w
-        if xs[0]-1 <= x0 <= xs[1]+1 and x1 <= xs[1]+2 and y0>200 and re.fullmatch(r"\d{4,7}",t.strip()):
-            starts.append((float(y0),t.strip()))
-    starts.sort()
-    uniq=[]
-    for z in starts:
-        if not uniq or abs(z[0]-uniq[-1][0])>2: uniq.append(z)
-    if not uniq: return []
-    tops=[z[0] for z in uniq]
-    rows=[[] for _ in uniq]
-    import bisect
-    for w in words:
-        x0,y0,x1,y1,t,*_=w
-        cy=(y0+y1)/2
-        ri=bisect.bisect_right(tops,cy)-1
-        if ri<0: continue
-        bottom=tops[ri+1]-1 if ri+1<len(tops) else page.rect.height-5
-        if not (tops[ri]-1 <= cy < bottom): continue
-        cx=(x0+x1)/2
-        # find column by center x
-        ci=bisect.bisect_right(xs,cx)-1
-        if 0<=ci<16:
-            rows[ri].append((y0,x0,t))
     result=[]
-    for ri,rowwords in enumerate(rows):
+    import bisect
+    for ya,yb in zip(ys,ys[1:]):
+        # Ignore document/header bands. Data rows contain a numeric No. in col 0.
+        if yb-ya<10 or ya<250:
+            continue
         cells=[[] for _ in range(16)]
-        for y,x,t in rowwords:
-            # Recompute column for the grouped word; keeps sorting simple.
-            ci=bisect.bisect_right(xs,x)-1
-            if 0<=ci<16: cells[ci].append((y,x,t))
+        for w in words:
+            x0,y0,x1,y1,t,*_=w
+            cx=(x0+x1)/2
+            cy=(y0+y1)/2
+            if not (ya+1 <= cy <= yb-1):
+                continue
+            ci=bisect.bisect_right(xs,cx)-1
+            if 0<=ci<16:
+                cells[ci].append((y0,x0,t))
         vals=[]
-        for cw in cells:
-            cw.sort(key=lambda z:(z[0],z[1]))
-            vals.append(clean(" ".join(z[2] for z in cw)))
-        if vals and re.fullmatch(r"\d{4,7}",vals[0]) and (not vals[1] or re.fullmatch(r"\d{5,10}",vals[1])) and (not vals[2] or re.fullmatch(r"\d{5,10}",vals[2])):
+        for c in cells:
+            c.sort(key=lambda z:(z[0],z[1]))
+            vals.append(clean(" ".join(z[2] for z in c)))
+        if looks_like_data_row(vals):
             result.append(vals)
     return result
 
@@ -164,9 +166,6 @@ def parse_pdf(data):
             progress.progress((pidx+1)/total,text=f"Revisando página {pidx+1} de {total}…")
             continue
         xs=table_boundaries(page)
-        if len(xs)!=17:
-            progress.progress((pidx+1)/total,text=f"Revisando página {pidx+1} de {total}…")
-            continue
         rows=extract_rows_from_words(page,xs)
         if rows: pages_scanned+=1
         printed=get_printed_page(text,pidx+1); section=get_section(text)
