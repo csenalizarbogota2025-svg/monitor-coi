@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-APP_VERSION='11.1'
+APP_VERSION='11.3'
 APP_NAME='Monitor COI'
 COLS=['No.','CIV INICIO','CIV FIN','DIRECCIÓN DE LA OBRA INICIO','DIRECCIÓN DE LA OBRA FIN','CONTRATISTA','FECHA INICIO','FECHA FIN','HORARIO DE TRABAJO','HORARIO DE CIERRE','No. CONTRATO','OBSERVACIONES','AUTORIZADO','LOCALIDAD','ING. RESPONSABLE','No RADICADO SDM']
 
@@ -209,41 +209,57 @@ def _row_matches_company_contract(block_norm, company_norm, contract_canon):
     return True
 
 def source_validation(data, df):
-    """Screening referencial: cuenta menciones de contratista/contrato en todo el PDF.
+    """Control referencial simple y robusto: cuenta menciones textuales en el PDF.
 
-    IMPORTANTE: estas son menciones textuales, no filas. Pueden incluir observaciones,
-    encabezados o referencias a terceros. Sirven como control de pantalla para detectar
-    posibles diferencias y dirigir la revisión manual; no se consideran una validación
-    exacta de registros.
+    No intenta reconstruir filas. El objetivo es comparar, de forma orientativa,
+    cuántas veces aparece el contratista/contrato en el PDF frente a los registros
+    extraídos. Las menciones pueden aparecer en OBSERVACIONES, encabezados o
+    referencias a terceros.
     """
     doc=fitz.open(stream=data,filetype='pdf')
-    # Normalizamos cada página por separado para conservar trazabilidad básica.
-    page_norms=[norm(p.get_text('text') or '') for p in doc]
+    page_texts=[p.get_text('text') or '' for p in doc]
     doc.close()
-    grouped=(df.groupby(['CONTRATISTA','CONTRATO CANÓNICO'],dropna=False)
-               .size().reset_index(name='REGISTROS_EXTRAÍDOS'))
+    grouped=(df.copy())
+    # Asegurar columnas y tipos para que la validación no derribe la app.
+    if 'CONTRATISTA' not in grouped.columns:
+        grouped['CONTRATISTA']=''
+    if 'CONTRATO CANÓNICO' not in grouped.columns:
+        if 'No. CONTRATO' in grouped.columns:
+            grouped['CONTRATO CANÓNICO']=grouped['No. CONTRATO'].map(contract_canonical)
+        else:
+            grouped['CONTRATO CANÓNICO']=''
+    grouped['CONTRATISTA']=grouped['CONTRATISTA'].fillna('').map(clean)
+    grouped['CONTRATO CANÓNICO']=grouped['CONTRATO CANÓNICO'].fillna('').map(clean)
+    g=grouped.groupby(['CONTRATISTA','CONTRATO CANÓNICO'],dropna=False).size().reset_index(name='REGISTROS_EXTRAÍDOS')
     rows=[]
-    for _,r in grouped.iterrows():
-        company=clean(r.get('CONTRATISTA',''))
-        contract=clean(r.get('CONTRATO CANÓNICO',''))
+    full_text='\n'.join(page_texts)
+    full_norm=norm(full_text)
+    for _,r in g.iterrows():
+        company=clean(r['CONTRATISTA'])
+        contract=clean(r['CONTRATO CANÓNICO'])
         c=norm(company)
-        variants=_contract_variants(contract)
-        company_mentions=sum(txt.count(c) for txt in page_norms) if c else 0
-        contract_mentions=sum(sum(txt.count(v) for v in variants) for txt in page_norms) if variants else 0
+        mentions_company=full_norm.count(c) if c else 0
+        # Para el contrato usamos una búsqueda tolerante de sus variantes.
+        mentions_contract=0
+        try:
+            for v in _contract_variants(contract):
+                mentions_contract=max(mentions_contract,full_norm.count(norm(v)))
+        except Exception:
+            mentions_contract=0
         extracted=int(r['REGISTROS_EXTRAÍDOS'])
-        # Mensiones del contratista sirven solo como referencia. Pueden superar los registros
-        # por apariciones en observaciones y pueden ser menores cuando el PDF separa el nombre.
-        diff=company_mentions-extracted
+        diff=mentions_company-extracted
         rows.append({
             'CONTRATISTA':company,
             'CONTRATO CANÓNICO':contract,
-            'MENCIONES CONTRATISTA EN PDF':company_mentions,
-            'MENCIONES CONTRATO EN PDF':contract_mentions,
+            'MENCIONES CONTRATISTA EN PDF':mentions_company,
+            'MENCIONES CONTRATO EN PDF':mentions_contract,
             'REGISTROS EXTRAÍDOS':extracted,
             'DIFERENCIA REFERENCIAL':diff,
-            'VALIDACIÓN':'🔎 REVISAR MANUALMENTE' if diff!=0 else '✅ COINCIDE',
+            'VALIDACIÓN':'⚠️ REVISAR' if diff!=0 else '✅ OK',
         })
-    return pd.DataFrame(rows).sort_values(['VALIDACIÓN','REGISTROS_EXTRAÍDOS'],ascending=[True,False]).reset_index(drop=True)
+    if not rows:
+        return pd.DataFrame(columns=['CONTRATISTA','CONTRATO CANÓNICO','MENCIONES CONTRATISTA EN PDF','MENCIONES CONTRATO EN PDF','REGISTROS EXTRAÍDOS','DIFERENCIA REFERENCIAL','VALIDACIÓN'])
+    return pd.DataFrame(rows).sort_values(['VALIDACIÓN','REGISTROS EXTRAÍDOS'],ascending=[True,False]).reset_index(drop=True)
 
 def extract_pdf(data, progress=None):
     doc=fitz.open(stream=data,filetype='pdf')
@@ -315,7 +331,7 @@ with st.sidebar:
     st.write('2️⃣ Analiza el COI')
     st.write('3️⃣ Filtra empresas y contratos')
     st.write('4️⃣ Genera la lista')
-    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 11.0</div>',unsafe_allow_html=True)
+    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 11.3</div>',unsafe_allow_html=True)
 
 uploaded=st.file_uploader('📥 CARGA 1 · Selecciona el COI oficial en PDF',type=['pdf'])
 if uploaded:
