@@ -384,7 +384,7 @@ with t1:
         hp=horarios.head(25); fig=px.bar(hp,y="HORARIO DE TRABAJO",x="REGISTROS",orientation="h",text="REGISTROS"); fig.update_layout(height=470,margin=dict(l=10,r=10,t=10,b=20),yaxis_title="",xaxis_title="Registros"); st.plotly_chart(fig,use_container_width=True)
     with c6:
         st.markdown("#### ⏰ Horario vs. estado")
-        long=horarios.head(20).melt(id_vars="HORARIO DE TRABAJO",value_vars=["AUTORIZADOS","NO AUTORIZADOS","EMERGENCIAS"],var_name="Estado",value_name="Cantidad"); fig=px.bar(long,x="HORARIO DE TRABAJO",y="Cantidad",color="Estado",barmode="group",text="Cantidad"); fig.update_layout(height=470,margin=dict(l=10,r=10,t=10,b=110),xaxis_title="",yaxis_title="Registros",xaxis_tickangle=-45); st.plotly_chart(fig,use_container_width=True)
+        long=horarios.head(20).melt(id_vars="HORARIO DE TRABAJO",value_vars=["AUTORIZADOS","NO_AUTORIZADOS","EMERGENCIAS"],var_name="Estado",value_name="Cantidad"); fig=px.bar(long,x="HORARIO DE TRABAJO",y="Cantidad",color="Estado",barmode="group",text="Cantidad"); fig.update_layout(height=470,margin=dict(l=10,r=10,t=10,b=110),xaxis_title="",yaxis_title="Registros",xaxis_tickangle=-45); st.plotly_chart(fig,use_container_width=True)
     st.markdown("#### 🕐 Resumen 24 HORAS")
     h24a=int((h24&(df["ESTADO INTERPRETADO"]=="AUTORIZADO")).sum())
     a,b,c=st.columns(3); a.metric("Registros 24 HORAS",int(h24.sum())); b.metric("24 HORAS autorizados",h24a); c.metric("24 HORAS no autorizados",int(h24.sum())-h24a)
