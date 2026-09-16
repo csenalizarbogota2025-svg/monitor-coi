@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-APP_VERSION='10.4'
+APP_VERSION='10.5'
 APP_NAME='Monitor COI'
 COLS=['No.','CIV INICIO','CIV FIN','DIRECCIÓN DE LA OBRA INICIO','DIRECCIÓN DE LA OBRA FIN','CONTRATISTA','FECHA INICIO','FECHA FIN','HORARIO DE TRABAJO','HORARIO DE CIERRE','No. CONTRATO','OBSERVACIONES','AUTORIZADO','LOCALIDAD','ING. RESPONSABLE','No RADICADO SDM']
 
@@ -127,37 +127,59 @@ def extract_page(page):
     return out
 
 def _validation_row_catalog(data):
-    """Build an independent catalog of real COI rows from the PDF text stream.
+    """Independent row catalog using row anchors + official table columns.
 
-    A COI row begins with its No. followed by CIV INICIO and CIV FIN (or N/A).
-    We group text until the next row No. and then use the contractor + contract
-    appearing within that same row block. This avoids counting mentions of a
-    contractor inside OBSERVACIONES as separate records.
+    The No. column is used only as the row anchor.  Each row is then rebuilt
+    by taking all PDF words inside the vertical interval between this No. and
+    the next No., and assigning them to the official COI x-bands. This avoids
+    counting contractor mentions that live inside OBSERVACIONES.
     """
+    X=[74,123,191,259,358,456,585,652,718,796,874,952,1593,1688,1785,1886,2009]
     doc=fitz.open(stream=data,filetype='pdf')
     catalog=[]
-    row_start=re.compile(r'^\s*(\d{4,8})\s*$')
-    civ_line=re.compile(r'^\s*(?:\d{5,10}|N/A|-)\s*$')
     for pi,page in enumerate(doc):
-        lines=[clean(x) for x in page.get_text('text').splitlines() if clean(x)]
-        starts=[]
-        # A row starts with a 4-8 digit No. and the next two non-empty lines are CIVs/N/A.
-        for i,line in enumerate(lines):
-            m=row_start.fullmatch(line)
-            if not m or i+2>=len(lines):
-                continue
-            if civ_line.fullmatch(lines[i+1]) and civ_line.fullmatch(lines[i+2]):
-                starts.append((i,m.group(1)))
-        for n,(idx,no) in enumerate(starts):
-            end_idx=starts[n+1][0] if n+1<len(starts) else len(lines)
-            block=' '.join(lines[idx:end_idx])
-            # Keep only actual row blocks; headers/footers don't have the CIV pattern above.
-            catalog.append((pi+1,no,norm(block),block))
+        words=page.get_text('words')
+        anchors=[]
+        for w in words:
+            x0,y0,x1,y1,text,*_=w
+            if 74 <= x0 <= 130 and re.fullmatch(r'\d{4,8}',text.strip()):
+                try: no=int(text.strip())
+                except: continue
+                if 10000 <= no <= 99999:
+                    anchors.append((y0,y1,no))
+        anchors.sort(key=lambda z:(z[0],z[2]))
+        uniq=[]
+        for a in anchors:
+            if not uniq or abs(a[0]-uniq[-1][0])>2 or a[2]!=uniq[-1][2]:
+                uniq.append(a)
+        for i,(y0,y1,no) in enumerate(uniq):
+            start_y=((uniq[i-1][0]+y0)/2) if i>0 else 260
+            end_y=((y0+uniq[i+1][0])/2) if i+1<len(uniq) else page.rect.height-25
+            cells=['']*16
+            for w in words:
+                x0,wy0,x1,wy1,text,*_=w
+                if wy0 < start_y or wy0 > end_y:
+                    continue
+                cx=(x0+x1)/2
+                for k in range(16):
+                    if X[k]-1 <= cx <= X[k+1]+1:
+                        cells[k]=clean(cells[k]+' '+text)
+                        break
+            cells[0]=str(no)
+            # Keep source row as a structured record; contractor is cell 5,
+            # contract is cell 10, and the original No. is cell 0.
+            catalog.append({
+                'PÁGINA PDF':pi+1,
+                'No.':str(no),
+                'CONTRATISTA':cells[5],
+                'No. CONTRATO':cells[10],
+                'CONTRATISTA_NORM':norm(cells[5]),
+                'CONTRATO_CANÓNICO':contract_canonical(cells[10])
+            })
     doc.close()
-    # Deduplicate by physical page + row No.
     seen=set(); out=[]
     for item in catalog:
-        key=(item[0],item[1])
+        key=(item['PÁGINA PDF'],item['No.'])
         if key not in seen:
             seen.add(key); out.append(item)
     return out
@@ -182,22 +204,18 @@ def contract_matches_block(target_contract, block_norm):
     return norm(raw) in block_norm
 
 def source_validation(data, df):
-    """Validate extracted counts against independently detected PDF rows."""
+    """Compare extracted rows against independent row/cell detection in PDF."""
     catalog=_pdf_row_catalog(data)
-    grouped=df.groupby(['CONTRATISTA','CONTRATO CANÓNICO'],dropna=False).size().reset_index(name='REGISTROS EXTRAÍDOS')
+    grouped=(df.groupby(['CONTRATISTA','CONTRATO CANÓNICO'],dropna=False)
+               .size().reset_index(name='REGISTROS EXTRAÍDOS'))
     rows=[]
     for _,r in grouped.iterrows():
         company=clean(r['CONTRATISTA']); contract=clean(r['CONTRATO CANÓNICO'])
-        c=norm(company)
-        k=norm(contract)
-        # Accept the official COI notation (e.g. SDM-3651-2024) and its canonical form (2024-3651).
-        unique_nos=[]; seen=set()
-        for _,no,row_text,_raw in catalog:
-            match_contract = contract_matches_block(contract, row_text) if contract else True
-            if c and c in row_text and match_contract:
-                if no not in seen:
-                    seen.add(no); unique_nos.append(no)
-        source_count=len(unique_nos)
+        c=norm(company); k=contract_canonical(contract)
+        matched=[x for x in catalog if x['CONTRATISTA_NORM']==c and x['CONTRATO_CANÓNICO']==k]
+        # Unique by physical page + COI No.
+        uniq={(x['PÁGINA PDF'],x['No.']) for x in matched}
+        source_count=len(uniq)
         extracted=int(r['REGISTROS EXTRAÍDOS'])
         diff=source_count-extracted
         rows.append({
@@ -208,9 +226,7 @@ def source_validation(data, df):
             'DIFERENCIA':diff,
             'VALIDACIÓN':'✅ OK' if diff==0 else '⚠️ REVISAR'
         })
-    out=pd.DataFrame(rows)
-    if out.empty:return out
-    return out.sort_values(['VALIDACIÓN','REGISTROS EXTRAÍDOS'],ascending=[True,False]).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values(['VALIDACIÓN','REGISTROS EXTRAÍDOS'],ascending=[True,False])
 
 def extract_pdf(data, progress=None):
     doc=fitz.open(stream=data,filetype='pdf')
@@ -275,7 +291,7 @@ with st.sidebar:
     st.write('2️⃣ Analiza el COI')
     st.write('3️⃣ Filtra empresas y contratos')
     st.write('4️⃣ Genera la lista')
-    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 10.4</div>',unsafe_allow_html=True)
+    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 10.5</div>',unsafe_allow_html=True)
 
 uploaded=st.file_uploader('📥 CARGA 1 · Selecciona el COI oficial en PDF',type=['pdf'])
 if uploaded:

@@ -1,2 +1,3 @@
-# Monitor COI v10.4
-Validación independiente de filas: identifica cada registro por No. + CIV inicio + CIV fin y valida contratista/contrato dentro del mismo bloque de fila, soportando las variantes SDM-3651-2024, SDM-3651- 2024 y 2024-3651.
+# Monitor COI v10.5
+
+Corrección de la validación PDF vs registros extraídos. La validación ahora reconstruye cada fila usando el No. como ancla y las columnas oficiales del formato COI, comparando CONTRATISTA + No. CONTRATO dentro de la misma fila. Esto evita contar menciones del contratista dentro de OBSERVACIONES.
