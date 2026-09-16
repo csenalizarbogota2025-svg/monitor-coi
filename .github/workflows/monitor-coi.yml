@@ -3,7 +3,7 @@ name: Monitor COI semanal
 on:
   workflow_dispatch:
   schedule:
-    # Viernes 13:00 COT (18:00 UTC). GitHub puede ejecutar con algunos minutos de retraso.
+    # Viernes 07:00 COT (12:00 UTC). GitHub puede ejecutar con algunos minutos de retraso.
     - cron: '0 12 * * 5'
 
 permissions:
