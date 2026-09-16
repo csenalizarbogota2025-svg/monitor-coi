@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-APP_VERSION='10.1'
+APP_VERSION='10.3'
 APP_NAME='Monitor COI'
 COLS=['No.','CIV INICIO','CIV FIN','DIRECCIÓN DE LA OBRA INICIO','DIRECCIÓN DE LA OBRA FIN','CONTRATISTA','FECHA INICIO','FECHA FIN','HORARIO DE TRABAJO','HORARIO DE CIERRE','No. CONTRATO','OBSERVACIONES','AUTORIZADO','LOCALIDAD','ING. RESPONSABLE','No RADICADO SDM']
 
@@ -126,36 +126,92 @@ def extract_page(page):
             out.append(cells)
     return out
 
-def source_validation(data, df):
-    """Compare contractor/contract mentions in the raw PDF text with extracted rows."""
+def _validation_row_catalog(data):
+    """Build an independent row catalog using the actual contractor and contract cells.
+
+    This deliberately does NOT search the entire row text because contractor names often
+    appear again inside OBSERVACIONES, which would create false counts.
+    """
     doc=fitz.open(stream=data,filetype='pdf')
-    pages=[page.get_text('text') for page in doc]
+    catalog=[]
+    for pi,page in enumerate(doc):
+        words=page.get_text('words')
+        xs=find_verticals(page)
+        hfull=[]
+        for dr in page.get_drawings():
+            for item in dr.get('items',[]):
+                if item[0]=='l':
+                    a,b=item[1],item[2]
+                    if abs(a.y-b.y)<1.5 and (b.x-a.x)>1700:
+                        hfull.append((min(a.x,b.x),max(a.x,b.x),round((a.y+b.y)/2,1)))
+        if hfull:
+            xs=[min(v[0] for v in hfull)]+xs+[max(v[1] for v in hfull)]
+        xs=sorted(set(round(x,1) for x in xs))
+        if len(xs)>17:
+            target=[74,123,191,259,358,456,585,652,718,796,874,952,1593,1688,1785,1886,2009]
+            chosen=[]
+            for t in target:
+                nearest=min(xs,key=lambda x:abs(x-t))
+                if nearest not in chosen: chosen.append(nearest)
+            if len(chosen)==17: xs=chosen
+        ys=find_horizontal_rows(page)
+        if len(xs)!=17 or len(ys)<2: continue
+        for ya,yb in zip(ys,ys[1:]):
+            if yb-ya<15: continue
+            rw=[w for w in words if w[1]>=ya-1 and w[3]<=yb+1]
+            nums=[w for w in rw if xs[0]-3<=w[0]<=xs[1]+3 and re.fullmatch(r'\d{4,8}',w[4].strip())]
+            if not nums: continue
+            no=nums[0][4].strip()
+            ctr=clean(' '.join(w[4] for w in rw if xs[5]-1<=((w[0]+w[2])/2)<=xs[6]+1))
+            con=clean(' '.join(w[4] for w in rw if xs[10]-1<=((w[0]+w[2])/2)<=xs[11]+1))
+            catalog.append((pi+1,no,norm(ctr),contract_canonical(con)))
     doc.close()
-    full_norm=[norm(t) for t in pages]
-    rows=[]
+    seen=set(); out=[]
+    for item in catalog:
+        key=(item[0],item[1])
+        if key not in seen:
+            seen.add(key); out.append(item)
+    return out
+
+def _pdf_row_catalog(data):
+    """Backward-compatible alias."""
+    return _validation_row_catalog(data)
+
+
+def source_validation(data, df):
+    """Validate extracted counts against independently detected PDF rows."""
+    catalog=_pdf_row_catalog(data)
     grouped=df.groupby(['CONTRATISTA','CONTRATO CANÓNICO'],dropna=False).size().reset_index(name='REGISTROS EXTRAÍDOS')
+    rows=[]
     for _,r in grouped.iterrows():
         company=clean(r['CONTRATISTA']); contract=clean(r['CONTRATO CANÓNICO'])
-        c=norm(company); k=norm(contract)
-        mentions_company=sum(t.count(c) for t in full_norm if c)
-        # The contractor is normally followed by date/contract in the same row.
-        # Count each contractor->contract occurrence within a bounded window on each page.
-        pair_count=0
-        if c and k:
-            pattern=re.compile(re.escape(c)+r'.{0,220}'+re.escape(k))
-            pair_count=sum(len(pattern.findall(t)) for t in full_norm)
-        source_count=pair_count if pair_count else mentions_company
+        c=norm(company)
+        k=norm(contract)
+        # Accept the official COI notation (e.g. SDM-3651-2024) and its canonical form (2024-3651).
+        contract_keys={k} if k else set()
+        m=re.fullmatch(r'(20\d{2})(\d{3,5})',k or '')
+        if m:
+            year,num=m.group(1),m.group(2)
+            contract_keys.update({year+num,num+year})
+        unique_nos=[]; seen=set()
+        for _,no,row_ctr,row_contract in catalog:
+            match_contract = (not contract_keys) or any(contract_canonical(row_contract)==contract_canonical(v) for v in contract_keys)
+            if c and c in row_ctr and match_contract:
+                if no not in seen:
+                    seen.add(no); unique_nos.append(no)
+        source_count=len(unique_nos)
+        extracted=int(r['REGISTROS EXTRAÍDOS'])
+        diff=source_count-extracted
         rows.append({
             'CONTRATISTA':company,
             'CONTRATO CANÓNICO':contract,
-            'APARICIONES DETECTADAS EN PDF':int(source_count),
-            'REGISTROS EXTRAÍDOS':int(r['REGISTROS EXTRAÍDOS']),
-            'DIFERENCIA':int(source_count-r['REGISTROS EXTRAÍDOS']),
-            'VALIDACIÓN':'✅ OK' if source_count==int(r['REGISTROS EXTRAÍDOS']) else '⚠️ REVISAR'
+            'FILAS IDENTIFICADAS EN PDF':source_count,
+            'REGISTROS EXTRAÍDOS':extracted,
+            'DIFERENCIA':diff,
+            'VALIDACIÓN':'✅ OK' if diff==0 else '⚠️ REVISAR'
         })
     out=pd.DataFrame(rows)
-    if out.empty:
-        return out
+    if out.empty:return out
     return out.sort_values(['VALIDACIÓN','REGISTROS EXTRAÍDOS'],ascending=[True,False]).reset_index(drop=True)
 
 def extract_pdf(data, progress=None):
@@ -255,7 +311,7 @@ else:
             m3.metric('Revisar',f'{rev:,}')
             st.dataframe(validation,use_container_width=True,hide_index=True)
             if rev:
-                st.warning('Se detectaron diferencias entre las apariciones estimadas en el texto del PDF y los registros extraídos. Revisa las filas marcadas antes de usar el resultado para control.')
+                st.warning('Se detectaron diferencias entre las filas identificadas en el PDF y los registros extraídos. Revisa las filas marcadas antes de usar el resultado para control.')
             else:
                 st.success('La validación no detectó diferencias en los contratistas/contratos analizados.')
         else:

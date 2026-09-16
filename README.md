@@ -1,6 +1,3 @@
-# Monitor COI v10.1
+# Monitor COI v10.2
 
-Mejora de v10.0:
-- Barra de progreso visible durante el análisis página por página.
-- Validación PDF vs. registros extraídos por contratista y contrato.
-- La validación queda visible en pantalla y también en el Excel.
+Validación corregida: cuenta filas del PDF por No. de registro + contratista + contrato, evitando falsos desajustes por menciones en observaciones, encabezados o pies de página.
