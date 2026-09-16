@@ -1,3 +1,3 @@
-# Monitor COI v10.5
+# Monitor COI v10.6
 
-Corrección de la validación PDF vs registros extraídos. La validación ahora reconstruye cada fila usando el No. como ancla y las columnas oficiales del formato COI, comparando CONTRATISTA + No. CONTRATO dentro de la misma fila. Esto evita contar menciones del contratista dentro de OBSERVACIONES.
+Validación independiente PDF vs. registros extraídos mediante bloques de filas en orden de lectura. Reconoce contratos en formatos `SDM-NNNN-YYYY`, `SDM-NNNN- YYYY`, `YYYY-NNNN` y equivalentes, evitando contar menciones del contratista dentro de observaciones.

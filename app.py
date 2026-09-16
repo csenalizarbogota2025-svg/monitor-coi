@@ -127,62 +127,109 @@ def extract_page(page):
     return out
 
 def _validation_row_catalog(data):
-    """Independent row catalog using row anchors + official table columns.
+    """Independent validation catalog based on the PDF's reading-order row blocks.
 
-    The No. column is used only as the row anchor.  Each row is then rebuilt
-    by taking all PDF words inside the vertical interval between this No. and
-    the next No., and assigning them to the official COI x-bands. This avoids
-    counting contractor mentions that live inside OBSERVACIONES.
+    The main extractor already uses the table geometry. For validation we deliberately
+    use a different mechanism: page text is split into row blocks using the COI No.
+    printed at the beginning of each record. This avoids relying on the same x-bands
+    as the extractor and avoids false counts from contractor mentions inside OBSERVACIONES.
     """
-    X=[74,123,191,259,358,456,585,652,718,796,874,952,1593,1688,1785,1886,2009]
     doc=fitz.open(stream=data,filetype='pdf')
     catalog=[]
+    row_start=re.compile(r'^(\d{4,8})(?:\s|$)')
     for pi,page in enumerate(doc):
-        words=page.get_text('words')
-        anchors=[]
-        for w in words:
-            x0,y0,x1,y1,text,*_=w
-            if 74 <= x0 <= 130 and re.fullmatch(r'\d{4,8}',text.strip()):
-                try: no=int(text.strip())
-                except: continue
-                if 10000 <= no <= 99999:
-                    anchors.append((y0,y1,no))
-        anchors.sort(key=lambda z:(z[0],z[2]))
-        uniq=[]
-        for a in anchors:
-            if not uniq or abs(a[0]-uniq[-1][0])>2 or a[2]!=uniq[-1][2]:
-                uniq.append(a)
-        for i,(y0,y1,no) in enumerate(uniq):
-            start_y=((uniq[i-1][0]+y0)/2) if i>0 else 260
-            end_y=((y0+uniq[i+1][0])/2) if i+1<len(uniq) else page.rect.height-25
-            cells=['']*16
-            for w in words:
-                x0,wy0,x1,wy1,text,*_=w
-                if wy0 < start_y or wy0 > end_y:
-                    continue
-                cx=(x0+x1)/2
-                for k in range(16):
-                    if X[k]-1 <= cx <= X[k+1]+1:
-                        cells[k]=clean(cells[k]+' '+text)
-                        break
-            cells[0]=str(no)
-            # Keep source row as a structured record; contractor is cell 5,
-            # contract is cell 10, and the original No. is cell 0.
+        lines=[clean(x) for x in page.get_text('text').splitlines() if clean(x)]
+        starts=[]
+        for idx,line in enumerate(lines):
+            m=row_start.match(line)
+            if not m:
+                continue
+            no=m.group(1)
+            # COI record numbers are five digits in these reports; keep a broad range
+            # to tolerate future layouts while ignoring dates/radicados.
+            try: n=int(no)
+            except: continue
+            if 10000 <= n <= 99999:
+                starts.append((idx,no))
+        # Remove duplicated anchors on the same page.
+        uniq=[]; seen=set()
+        for idx,no in starts:
+            key=(idx,no)
+            if key not in seen:
+                seen.add(key); uniq.append((idx,no))
+        for j,(idx,no) in enumerate(uniq):
+            end_idx=uniq[j+1][0] if j+1<len(uniq) else len(lines)
+            block=' '.join(lines[idx:end_idx])
+            block_norm=norm(block)
+            # Store the whole normalized row block; matching is performed separately
+            # for company + contract and therefore ignores observations unless the
+            # exact company/contract pair occurs in the row in the expected order.
             catalog.append({
                 'PÁGINA PDF':pi+1,
                 'No.':str(no),
-                'CONTRATISTA':cells[5],
-                'No. CONTRATO':cells[10],
-                'CONTRATISTA_NORM':norm(cells[5]),
-                'CONTRATO_CANÓNICO':contract_canonical(cells[10])
+                'BLOQUE_NORM':block_norm
             })
     doc.close()
-    seen=set(); out=[]
-    for item in catalog:
-        key=(item['PÁGINA PDF'],item['No.'])
-        if key not in seen:
-            seen.add(key); out.append(item)
-    return out
+    return catalog
+
+def _pdf_row_catalog(data):
+    return _validation_row_catalog(data)
+
+def _row_matches_company_contract(block_norm, company_norm, contract_canon):
+    """Match a company/contract pair inside one PDF row block.
+
+    Requiring company before contract prevents a contractor mention in OBSERVACIONES
+    (which comes later in the row) from being counted as a separate record.
+    """
+    if not block_norm or not company_norm or not contract_canon:
+        return False
+    cands={contract_canon}
+    raw=contract_canon
+    # Canonical form can be YYYY-NNNN or NNNN-YYYY. Add all spellings
+    # commonly present in the COI, including the SDM-prefixed form.
+    m=re.match(r'(20\d{2})-(\d{3,5})$',raw)
+    if m:
+        year,num=m.group(1),m.group(2)
+        cands.update({norm(f'SDM-{num}-{year}'), norm(f'{num}-{year}'), norm(f'{year}-{num}'), norm(f'{num}{year}'), norm(f'{year}{num}')})
+    else:
+        m=re.match(r'(\d{3,5})-(20\d{2})$',raw)
+        if m:
+            num,year=m.group(1),m.group(2)
+            cands.update({norm(f'SDM-{num}-{year}'), norm(f'{num}-{year}'), norm(f'{year}-{num}'), norm(f'{num}{year}'), norm(f'{year}{num}')})
+    cpos=[block_norm.find(v) for v in cands if v]
+    cpos=[x for x in cpos if x>=0]
+    if not cpos:
+        return False
+    pos_contract=min(cpos)
+    pos_company=block_norm.find(company_norm)
+    return pos_company>=0 and pos_company < pos_contract
+
+def source_validation(data, df):
+    """Compare extracted rows against an independent reading-order validation.
+
+    Counts actual COI row blocks containing the same contractor+contract pair.
+    """
+    catalog=_pdf_row_catalog(data)
+    grouped=(df.groupby(['CONTRATISTA','CONTRATO CANÓNICO'],dropna=False)
+               .size().reset_index(name='REGISTROS EXTRAÍDOS'))
+    rows=[]
+    for _,r in grouped.iterrows():
+        company=clean(r['CONTRATISTA']); contract=clean(r['CONTRATO CANÓNICO'])
+        c=norm(company); k=contract_canonical(contract)
+        matched=[x for x in catalog if _row_matches_company_contract(x['BLOQUE_NORM'], c, k)]
+        uniq={(x['PÁGINA PDF'],x['No.']) for x in matched}
+        source_count=len(uniq)
+        extracted=int(r['REGISTROS EXTRAÍDOS'])
+        diff=source_count-extracted
+        rows.append({
+            'CONTRATISTA':company,
+            'CONTRATO CANÓNICO':contract,
+            'FILAS IDENTIFICADAS EN PDF':source_count,
+            'REGISTROS EXTRAÍDOS':extracted,
+            'DIFERENCIA':diff,
+            'VALIDACIÓN':'✅ OK' if diff==0 else '⚠️ REVISAR'
+        })
+    return pd.DataFrame(rows).sort_values(['VALIDACIÓN','REGISTROS EXTRAÍDOS'],ascending=[True,False])
 
 def _pdf_row_catalog(data):
     """Backward-compatible alias."""
