@@ -26,7 +26,9 @@ COLS = [
     "CONTRATISTA", "FECHA INICIO", "FECHA FIN", "HORARIO DE TRABAJO", "HORARIO DE CIERRE",
     "No. CONTRATO", "OBSERVACIONES", "AUTORIZADO", "LOCALIDAD", "ING. RESPONSABLE", "No RADICADO SDM"
 ]
-X = [75, 125, 195, 265, 355, 470, 590, 655, 720, 800, 875, 950, 1600, 1695, 1810, 1880, 2015]
+# Líneas verticales reales del formato oficial COI (incluye Sección 1 y Sección 2).
+# Las columnas CIV y DIRECCIÓN tienen subcolumnas; por eso deben respetarse sus límites reales.
+X = [37, 123, 191, 259, 357, 456, 585, 652, 718, 796, 874, 952, 1593, 1688, 1785, 1886, 2009]
 
 
 def norm(s):
