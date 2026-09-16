@@ -126,166 +126,109 @@ def extract_page(page):
             out.append(cells)
     return out
 
-def _validation_row_catalog(data):
-    """Independent validation catalog based on the PDF's reading-order row blocks.
+def _source_rows_from_text(data):
+    """Build a source-row catalog using robust 5-digit No. anchors in raw page text.
 
-    The main extractor already uses the table geometry. For validation we deliberately
-    use a different mechanism: page text is split into row blocks using the COI No.
-    printed at the beginning of each record. This avoids relying on the same x-bands
-    as the extractor and avoids false counts from contractor mentions inside OBSERVACIONES.
+    COI record numbers are 5 digits in these reports, while CIVs are usually 7-8+
+    digits and radicados are much longer. We therefore locate every 5-digit token
+    and use it as a candidate row anchor, then attach the following text until the
+    next candidate anchor. This is deliberately independent of table x-coordinates.
     """
     doc=fitz.open(stream=data,filetype='pdf')
     catalog=[]
-    row_start=re.compile(r'^(\d{4,8})(?:\s|$)')
+    no_re=re.compile(r'(?<!\d)(\d{5})(?!\d)')
     for pi,page in enumerate(doc):
-        lines=[clean(x) for x in page.get_text('text').splitlines() if clean(x)]
-        starts=[]
-        for idx,line in enumerate(lines):
-            m=row_start.match(line)
-            if not m:
-                continue
+        text=page.get_text('text') or ''
+        if not text.strip():
+            continue
+        matches=list(no_re.finditer(text))
+        # Candidate No. values in the COI are typically 20xxx-29xxx; keep a broad
+        # range to tolerate future reports, while rejecting obvious years/dates.
+        anchors=[]; seen=set()
+        for m in matches:
             no=m.group(1)
-            # COI record numbers are five digits in these reports; keep a broad range
-            # to tolerate future layouts while ignoring dates/radicados.
-            try: n=int(no)
-            except: continue
-            if 10000 <= n <= 99999:
-                starts.append((idx,no))
-        # Remove duplicated anchors on the same page.
-        uniq=[]; seen=set()
-        for idx,no in starts:
-            key=(idx,no)
-            if key not in seen:
-                seen.add(key); uniq.append((idx,no))
-        for j,(idx,no) in enumerate(uniq):
-            end_idx=uniq[j+1][0] if j+1<len(uniq) else len(lines)
-            block=' '.join(lines[idx:end_idx])
+            n=int(no)
+            if 10000 <= n <= 99999 and no not in seen:
+                seen.add(no); anchors.append((m.start(),m.end(),no))
+        # A page can contain duplicate 5-digit references elsewhere (e.g. in obs).
+        # Keep only anchors that look like the start of a record: after the number,
+        # the next ~120 chars should contain a plausible CIV/N/A/address token or the
+        # row's company/contract data. This reduces false anchors in observations.
+        for j,(st,en,no) in enumerate(anchors):
+            nxt=anchors[j+1][0] if j+1<len(anchors) else len(text)
+            block=text[st:nxt]
             block_norm=norm(block)
-            # Store the whole normalized row block; matching is performed separately
-            # for company + contract and therefore ignores observations unless the
-            # exact company/contract pair occurs in the row in the expected order.
-            catalog.append({
-                'PÁGINA PDF':pi+1,
-                'No.':str(no),
-                'BLOQUE_NORM':block_norm
-            })
+            # Avoid anchors that are clearly buried in a long observation/radicado.
+            head=norm(text[st:min(en+140,nxt)])
+            if len(block_norm)<15:
+                continue
+            # Record rows start with the number followed by CIV/address or N/A.
+            plausible=bool(re.search(r'\b(?:N/?A|\d{5,10}|AK|KR|CL|AC|AV|DG|TV|CARRERA|CALLE|AUTOPISTA|DIAGONAL|TRANSVERSAL)\b', head))
+            if not plausible:
+                continue
+            catalog.append({'PÁGINA PDF':pi+1,'No.':no,'BLOQUE_NORM':block_norm})
     doc.close()
     return catalog
 
+def _validation_row_catalog(data):
+    return _source_rows_from_text(data)
+
 def _pdf_row_catalog(data):
-    return _validation_row_catalog(data)
+    return _source_rows_from_text(data)
+
+def _contract_variants(contract):
+    k=contract_canonical(contract)
+    raw=norm(contract)
+    variants={k,raw}
+    # Canonical formats: YYYY-NNNN and NNNN-YYYY.
+    for value in [k, raw]:
+        m=re.match(r'(20\d{2})-(\d{3,5})$', value or '')
+        if m:
+            y,n=m.group(1),m.group(2)
+            variants.update({norm(f'SDM-{n}-{y}'),norm(f'SDM-{n}- {y}'),norm(f'{n}-{y}'),norm(f'{y}-{n}'),norm(f'{n}{y}'),norm(f'{y}{n}')})
+        m=re.match(r'(\d{3,5})-(20\d{2})$', value or '')
+        if m:
+            n,y=m.group(1),m.group(2)
+            variants.update({norm(f'SDM-{n}-{y}'),norm(f'SDM-{n}- {y}'),norm(f'{n}-{y}'),norm(f'{y}-{n}'),norm(f'{n}{y}'),norm(f'{y}{n}')})
+    return {v for v in variants if v}
 
 def _row_matches_company_contract(block_norm, company_norm, contract_canon):
-    """Match a company/contract pair inside one PDF row block.
-
-    Requiring company before contract prevents a contractor mention in OBSERVACIONES
-    (which comes later in the row) from being counted as a separate record.
-    """
     if not block_norm or not company_norm or not contract_canon:
         return False
-    cands={contract_canon}
-    raw=contract_canon
-    # Canonical form can be YYYY-NNNN or NNNN-YYYY. Add all spellings
-    # commonly present in the COI, including the SDM-prefixed form.
-    m=re.match(r'(20\d{2})-(\d{3,5})$',raw)
-    if m:
-        year,num=m.group(1),m.group(2)
-        cands.update({norm(f'SDM-{num}-{year}'), norm(f'{num}-{year}'), norm(f'{year}-{num}'), norm(f'{num}{year}'), norm(f'{year}{num}')})
-    else:
-        m=re.match(r'(\d{3,5})-(20\d{2})$',raw)
-        if m:
-            num,year=m.group(1),m.group(2)
-            cands.update({norm(f'SDM-{num}-{year}'), norm(f'{num}-{year}'), norm(f'{year}-{num}'), norm(f'{num}{year}'), norm(f'{year}{num}')})
-    cpos=[block_norm.find(v) for v in cands if v]
-    cpos=[x for x in cpos if x>=0]
-    if not cpos:
+    if company_norm not in block_norm:
         return False
-    pos_contract=min(cpos)
-    pos_company=block_norm.find(company_norm)
-    return pos_company>=0 and pos_company < pos_contract
+    positions=[]
+    for v in _contract_variants(contract_canon):
+        pos=block_norm.find(v)
+        if pos>=0:
+            positions.append(pos)
+    if not positions:
+        return False
+    # Require company and contract to be in the same row block. Do not require
+    # textual order because PDF reading order can put contract before contractor.
+    return True
 
 def source_validation(data, df):
-    """Validate extracted contractor+contract counts against independent PDF row blocks.
-
-    Robust to catalog schema changes: uses BLOCK_NORM records and never assumes
-    CONTRATISTA_NORM/CONTRATO_CANÓNICO keys exist in the validation catalog.
-    The source count is based on distinct PDF page + COI No. anchors.
-    """
-    catalog=_pdf_row_catalog(data)
+    """Validate contractor+contract counts against robust source row anchors."""
+    catalog=_source_rows_from_text(data)
     grouped=(df.groupby(['CONTRATISTA','CONTRATO CANÓNICO'],dropna=False)
                .size().reset_index(name='REGISTROS EXTRAÍDOS'))
     rows=[]
     for _,r in grouped.iterrows():
         company=clean(r.get('CONTRATISTA',''))
         contract=clean(r.get('CONTRATO CANÓNICO',''))
-        c=norm(company)
-        k=contract_canonical(contract)
-        matched=[]
-        for x in catalog:
-            block=x.get('BLOQUE_NORM','') if isinstance(x,dict) else ''
-            if _row_matches_company_contract(block, c, k):
-                matched.append(x)
-        uniq={(x.get('PÁGINA PDF'),x.get('No.')) for x in matched}
-        uniq={(p,n) for p,n in uniq if p is not None and n}
-        source_count=len(uniq)
-        extracted=int(r['REGISTROS EXTRAÍDOS'])
-        diff=source_count-extracted
-        rows.append({
-            'CONTRATISTA':company,
-            'CONTRATO CANÓNICO':contract,
-            'FILAS IDENTIFICADAS EN PDF':source_count,
-            'REGISTROS EXTRAÍDOS':extracted,
-            'DIFERENCIA':diff,
-            'VALIDACIÓN':'✅ OK' if diff==0 else '⚠️ REVISAR'
-        })
-    out=pd.DataFrame(rows)
-    if out.empty:
-        return out
-    return out.sort_values(['VALIDACIÓN','REGISTROS EXTRAÍDOS'],ascending=[True,False])
-
-def _pdf_row_catalog(data):
-    """Backward-compatible alias."""
-    return _validation_row_catalog(data)
-
-
-def contract_matches_block(target_contract, block_norm):
-    """Return True when the target contract is represented in a PDF row block.
-
-    Handles SDM-3651-2024, SDM-3651- 2024, 2024-3651 and the compact text
-    forms produced by PDF extraction.
-    """
-    raw=clean(target_contract).upper().replace(' ','')
-    m=re.search(r'(?:SDM-)?(\d{3,5})-(20\d{2})$',raw)
-    if m:
-        num,year=m.group(1),m.group(2)
-        variants={norm(f'SDM-{num}-{year}'),norm(f'{num}-{year}'),norm(f'{year}-{num}'),norm(f'{num}{year}'),norm(f'{year}{num}')}
-        return any(v and v in block_norm for v in variants)
-    return norm(raw) in block_norm
-
-def source_validation(data, df):
-    """Compare extracted rows against independent row/cell detection in PDF."""
-    catalog=_pdf_row_catalog(data)
-    grouped=(df.groupby(['CONTRATISTA','CONTRATO CANÓNICO'],dropna=False)
-               .size().reset_index(name='REGISTROS EXTRAÍDOS'))
-    rows=[]
-    for _,r in grouped.iterrows():
-        company=clean(r['CONTRATISTA']); contract=clean(r['CONTRATO CANÓNICO'])
         c=norm(company); k=contract_canonical(contract)
-        matched=[x for x in catalog if x['CONTRATISTA_NORM']==c and x['CONTRATO_CANÓNICO']==k]
-        # Unique by physical page + COI No.
-        uniq={(x['PÁGINA PDF'],x['No.']) for x in matched}
+        matched=[x for x in catalog if _row_matches_company_contract(x.get('BLOQUE_NORM',''),c,k)]
+        uniq={(x.get('PÁGINA PDF'),x.get('No.')) for x in matched if x.get('PÁGINA PDF') is not None and x.get('No.')}
         source_count=len(uniq)
         extracted=int(r['REGISTROS EXTRAÍDOS'])
         diff=source_count-extracted
-        rows.append({
-            'CONTRATISTA':company,
-            'CONTRATO CANÓNICO':contract,
-            'FILAS IDENTIFICADAS EN PDF':source_count,
-            'REGISTROS EXTRAÍDOS':extracted,
-            'DIFERENCIA':diff,
-            'VALIDACIÓN':'✅ OK' if diff==0 else '⚠️ REVISAR'
-        })
-    return pd.DataFrame(rows).sort_values(['VALIDACIÓN','REGISTROS EXTRAÍDOS'],ascending=[True,False])
+        rows.append({'CONTRATISTA':company,'CONTRATO CANÓNICO':contract,
+                     'FILAS IDENTIFICADAS EN PDF':source_count,
+                     'REGISTROS EXTRAÍDOS':extracted,'DIFERENCIA':diff,
+                     'VALIDACIÓN':'✅ OK' if diff==0 else '⚠️ REVISAR'})
+    out=pd.DataFrame(rows)
+    return out if out.empty else out.sort_values(['VALIDACIÓN','REGISTROS EXTRAÍDOS'],ascending=[True,False])
 
 def extract_pdf(data, progress=None):
     doc=fitz.open(stream=data,filetype='pdf')
@@ -350,7 +293,7 @@ with st.sidebar:
     st.write('2️⃣ Analiza el COI')
     st.write('3️⃣ Filtra empresas y contratos')
     st.write('4️⃣ Genera la lista')
-    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 10.7</div>',unsafe_allow_html=True)
+    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 10.8</div>',unsafe_allow_html=True)
 
 uploaded=st.file_uploader('📥 CARGA 1 · Selecciona el COI oficial en PDF',type=['pdf'])
 if uploaded:
