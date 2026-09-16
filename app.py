@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-APP_VERSION='10.3'
+APP_VERSION='10.4'
 APP_NAME='Monitor COI'
 COLS=['No.','CIV INICIO','CIV FIN','DIRECCIÓN DE LA OBRA INICIO','DIRECCIÓN DE LA OBRA FIN','CONTRATISTA','FECHA INICIO','FECHA FIN','HORARIO DE TRABAJO','HORARIO DE CIERRE','No. CONTRATO','OBSERVACIONES','AUTORIZADO','LOCALIDAD','ING. RESPONSABLE','No RADICADO SDM']
 
@@ -127,45 +127,34 @@ def extract_page(page):
     return out
 
 def _validation_row_catalog(data):
-    """Build an independent row catalog using the actual contractor and contract cells.
+    """Build an independent catalog of real COI rows from the PDF text stream.
 
-    This deliberately does NOT search the entire row text because contractor names often
-    appear again inside OBSERVACIONES, which would create false counts.
+    A COI row begins with its No. followed by CIV INICIO and CIV FIN (or N/A).
+    We group text until the next row No. and then use the contractor + contract
+    appearing within that same row block. This avoids counting mentions of a
+    contractor inside OBSERVACIONES as separate records.
     """
     doc=fitz.open(stream=data,filetype='pdf')
     catalog=[]
+    row_start=re.compile(r'^\s*(\d{4,8})\s*$')
+    civ_line=re.compile(r'^\s*(?:\d{5,10}|N/A|-)\s*$')
     for pi,page in enumerate(doc):
-        words=page.get_text('words')
-        xs=find_verticals(page)
-        hfull=[]
-        for dr in page.get_drawings():
-            for item in dr.get('items',[]):
-                if item[0]=='l':
-                    a,b=item[1],item[2]
-                    if abs(a.y-b.y)<1.5 and (b.x-a.x)>1700:
-                        hfull.append((min(a.x,b.x),max(a.x,b.x),round((a.y+b.y)/2,1)))
-        if hfull:
-            xs=[min(v[0] for v in hfull)]+xs+[max(v[1] for v in hfull)]
-        xs=sorted(set(round(x,1) for x in xs))
-        if len(xs)>17:
-            target=[74,123,191,259,358,456,585,652,718,796,874,952,1593,1688,1785,1886,2009]
-            chosen=[]
-            for t in target:
-                nearest=min(xs,key=lambda x:abs(x-t))
-                if nearest not in chosen: chosen.append(nearest)
-            if len(chosen)==17: xs=chosen
-        ys=find_horizontal_rows(page)
-        if len(xs)!=17 or len(ys)<2: continue
-        for ya,yb in zip(ys,ys[1:]):
-            if yb-ya<15: continue
-            rw=[w for w in words if w[1]>=ya-1 and w[3]<=yb+1]
-            nums=[w for w in rw if xs[0]-3<=w[0]<=xs[1]+3 and re.fullmatch(r'\d{4,8}',w[4].strip())]
-            if not nums: continue
-            no=nums[0][4].strip()
-            ctr=clean(' '.join(w[4] for w in rw if xs[5]-1<=((w[0]+w[2])/2)<=xs[6]+1))
-            con=clean(' '.join(w[4] for w in rw if xs[10]-1<=((w[0]+w[2])/2)<=xs[11]+1))
-            catalog.append((pi+1,no,norm(ctr),contract_canonical(con)))
+        lines=[clean(x) for x in page.get_text('text').splitlines() if clean(x)]
+        starts=[]
+        # A row starts with a 4-8 digit No. and the next two non-empty lines are CIVs/N/A.
+        for i,line in enumerate(lines):
+            m=row_start.fullmatch(line)
+            if not m or i+2>=len(lines):
+                continue
+            if civ_line.fullmatch(lines[i+1]) and civ_line.fullmatch(lines[i+2]):
+                starts.append((i,m.group(1)))
+        for n,(idx,no) in enumerate(starts):
+            end_idx=starts[n+1][0] if n+1<len(starts) else len(lines)
+            block=' '.join(lines[idx:end_idx])
+            # Keep only actual row blocks; headers/footers don't have the CIV pattern above.
+            catalog.append((pi+1,no,norm(block),block))
     doc.close()
+    # Deduplicate by physical page + row No.
     seen=set(); out=[]
     for item in catalog:
         key=(item[0],item[1])
@@ -178,6 +167,20 @@ def _pdf_row_catalog(data):
     return _validation_row_catalog(data)
 
 
+def contract_matches_block(target_contract, block_norm):
+    """Return True when the target contract is represented in a PDF row block.
+
+    Handles SDM-3651-2024, SDM-3651- 2024, 2024-3651 and the compact text
+    forms produced by PDF extraction.
+    """
+    raw=clean(target_contract).upper().replace(' ','')
+    m=re.search(r'(?:SDM-)?(\d{3,5})-(20\d{2})$',raw)
+    if m:
+        num,year=m.group(1),m.group(2)
+        variants={norm(f'SDM-{num}-{year}'),norm(f'{num}-{year}'),norm(f'{year}-{num}'),norm(f'{num}{year}'),norm(f'{year}{num}')}
+        return any(v and v in block_norm for v in variants)
+    return norm(raw) in block_norm
+
 def source_validation(data, df):
     """Validate extracted counts against independently detected PDF rows."""
     catalog=_pdf_row_catalog(data)
@@ -188,15 +191,10 @@ def source_validation(data, df):
         c=norm(company)
         k=norm(contract)
         # Accept the official COI notation (e.g. SDM-3651-2024) and its canonical form (2024-3651).
-        contract_keys={k} if k else set()
-        m=re.fullmatch(r'(20\d{2})(\d{3,5})',k or '')
-        if m:
-            year,num=m.group(1),m.group(2)
-            contract_keys.update({year+num,num+year})
         unique_nos=[]; seen=set()
-        for _,no,row_ctr,row_contract in catalog:
-            match_contract = (not contract_keys) or any(contract_canonical(row_contract)==contract_canonical(v) for v in contract_keys)
-            if c and c in row_ctr and match_contract:
+        for _,no,row_text,_raw in catalog:
+            match_contract = contract_matches_block(contract, row_text) if contract else True
+            if c and c in row_text and match_contract:
                 if no not in seen:
                     seen.add(no); unique_nos.append(no)
         source_count=len(unique_nos)
@@ -277,7 +275,7 @@ with st.sidebar:
     st.write('2️⃣ Analiza el COI')
     st.write('3️⃣ Filtra empresas y contratos')
     st.write('4️⃣ Genera la lista')
-    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 10.1</div>',unsafe_allow_html=True)
+    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 10.4</div>',unsafe_allow_html=True)
 
 uploaded=st.file_uploader('📥 CARGA 1 · Selecciona el COI oficial en PDF',type=['pdf'])
 if uploaded:
