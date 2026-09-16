@@ -205,19 +205,28 @@ def _row_matches_company_contract(block_norm, company_norm, contract_canon):
     return pos_company>=0 and pos_company < pos_contract
 
 def source_validation(data, df):
-    """Compare extracted rows against an independent reading-order validation.
+    """Validate extracted contractor+contract counts against independent PDF row blocks.
 
-    Counts actual COI row blocks containing the same contractor+contract pair.
+    Robust to catalog schema changes: uses BLOCK_NORM records and never assumes
+    CONTRATISTA_NORM/CONTRATO_CANÓNICO keys exist in the validation catalog.
+    The source count is based on distinct PDF page + COI No. anchors.
     """
     catalog=_pdf_row_catalog(data)
     grouped=(df.groupby(['CONTRATISTA','CONTRATO CANÓNICO'],dropna=False)
                .size().reset_index(name='REGISTROS EXTRAÍDOS'))
     rows=[]
     for _,r in grouped.iterrows():
-        company=clean(r['CONTRATISTA']); contract=clean(r['CONTRATO CANÓNICO'])
-        c=norm(company); k=contract_canonical(contract)
-        matched=[x for x in catalog if _row_matches_company_contract(x['BLOQUE_NORM'], c, k)]
-        uniq={(x['PÁGINA PDF'],x['No.']) for x in matched}
+        company=clean(r.get('CONTRATISTA',''))
+        contract=clean(r.get('CONTRATO CANÓNICO',''))
+        c=norm(company)
+        k=contract_canonical(contract)
+        matched=[]
+        for x in catalog:
+            block=x.get('BLOQUE_NORM','') if isinstance(x,dict) else ''
+            if _row_matches_company_contract(block, c, k):
+                matched.append(x)
+        uniq={(x.get('PÁGINA PDF'),x.get('No.')) for x in matched}
+        uniq={(p,n) for p,n in uniq if p is not None and n}
         source_count=len(uniq)
         extracted=int(r['REGISTROS EXTRAÍDOS'])
         diff=source_count-extracted
@@ -229,7 +238,10 @@ def source_validation(data, df):
             'DIFERENCIA':diff,
             'VALIDACIÓN':'✅ OK' if diff==0 else '⚠️ REVISAR'
         })
-    return pd.DataFrame(rows).sort_values(['VALIDACIÓN','REGISTROS EXTRAÍDOS'],ascending=[True,False])
+    out=pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(['VALIDACIÓN','REGISTROS EXTRAÍDOS'],ascending=[True,False])
 
 def _pdf_row_catalog(data):
     """Backward-compatible alias."""
@@ -338,7 +350,7 @@ with st.sidebar:
     st.write('2️⃣ Analiza el COI')
     st.write('3️⃣ Filtra empresas y contratos')
     st.write('4️⃣ Genera la lista')
-    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 10.5</div>',unsafe_allow_html=True)
+    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 10.7</div>',unsafe_allow_html=True)
 
 uploaded=st.file_uploader('📥 CARGA 1 · Selecciona el COI oficial en PDF',type=['pdf'])
 if uploaded:
@@ -351,8 +363,12 @@ if uploaded:
         df,diag=extract_pdf(data, progress)
         progress.progress(100, text=f'✅ Análisis terminado · {len(df):,} registros extraídos')
         status.success('✅ Extracción terminada. Ahora se valida lo extraído frente al texto del PDF...')
-        validation=source_validation(data, df)
-        status.success('✅ Validación terminada.')
+        try:
+            validation=source_validation(data, df)
+            status.success('✅ Validación terminada.')
+        except Exception as exc:
+            validation=pd.DataFrame()
+            status.warning(f'⚠️ La extracción terminó, pero la validación no pudo completarse en esta versión. Los registros extraídos se conservan. Detalle técnico: {type(exc).__name__}')
         st.session_state['coi_df']=df; st.session_state['coi_data']=data; st.session_state['coi_name']=uploaded.name; st.session_state['diag']=diag; st.session_state['validation']=validation
         st.session_state['generated']=True
         st.rerun()
