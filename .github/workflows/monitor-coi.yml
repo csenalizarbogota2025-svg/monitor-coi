@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     # Viernes 13:00 COT (18:00 UTC). GitHub puede ejecutar con algunos minutos de retraso.
-    - cron: '0 18 * * 5'
+    - cron: '0 12 * * 5'
 
 permissions:
   contents: write
