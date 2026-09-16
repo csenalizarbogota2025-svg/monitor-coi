@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-APP_VERSION='10.0'
+APP_VERSION='10.1'
 APP_NAME='Monitor COI'
 COLS=['No.','CIV INICIO','CIV FIN','DIRECCIÓN DE LA OBRA INICIO','DIRECCIÓN DE LA OBRA FIN','CONTRATISTA','FECHA INICIO','FECHA FIN','HORARIO DE TRABAJO','HORARIO DE CIERRE','No. CONTRATO','OBSERVACIONES','AUTORIZADO','LOCALIDAD','ING. RESPONSABLE','No RADICADO SDM']
 
@@ -126,9 +126,41 @@ def extract_page(page):
             out.append(cells)
     return out
 
-def extract_pdf(data):
+def source_validation(data, df):
+    """Compare contractor/contract mentions in the raw PDF text with extracted rows."""
     doc=fitz.open(stream=data,filetype='pdf')
-    records=[]; page_diag=[]; sections={}
+    pages=[page.get_text('text') for page in doc]
+    doc.close()
+    full_norm=[norm(t) for t in pages]
+    rows=[]
+    grouped=df.groupby(['CONTRATISTA','CONTRATO CANÓNICO'],dropna=False).size().reset_index(name='REGISTROS EXTRAÍDOS')
+    for _,r in grouped.iterrows():
+        company=clean(r['CONTRATISTA']); contract=clean(r['CONTRATO CANÓNICO'])
+        c=norm(company); k=norm(contract)
+        mentions_company=sum(t.count(c) for t in full_norm if c)
+        # The contractor is normally followed by date/contract in the same row.
+        # Count each contractor->contract occurrence within a bounded window on each page.
+        pair_count=0
+        if c and k:
+            pattern=re.compile(re.escape(c)+r'.{0,220}'+re.escape(k))
+            pair_count=sum(len(pattern.findall(t)) for t in full_norm)
+        source_count=pair_count if pair_count else mentions_company
+        rows.append({
+            'CONTRATISTA':company,
+            'CONTRATO CANÓNICO':contract,
+            'APARICIONES DETECTADAS EN PDF':int(source_count),
+            'REGISTROS EXTRAÍDOS':int(r['REGISTROS EXTRAÍDOS']),
+            'DIFERENCIA':int(source_count-r['REGISTROS EXTRAÍDOS']),
+            'VALIDACIÓN':'✅ OK' if source_count==int(r['REGISTROS EXTRAÍDOS']) else '⚠️ REVISAR'
+        })
+    out=pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(['VALIDACIÓN','REGISTROS EXTRAÍDOS'],ascending=[True,False]).reset_index(drop=True)
+
+def extract_pdf(data, progress=None):
+    doc=fitz.open(stream=data,filetype='pdf')
+    records=[]; page_diag=[]; total=len(doc)
     for pi,page in enumerate(doc):
         rows=extract_page(page)
         txt=page.get_text('text').upper()
@@ -144,10 +176,13 @@ def extract_pdf(data):
             else: state=clean(rec['AUTORIZADO']) or 'OTRO'
             rec['ESTADO INTERPRETADO']=state
             records.append(rec)
+        if progress is not None:
+            pct=int(((pi+1)/max(total,1))*100)
+            progress.progress(pct, text=f'Analizando página {pi+1:,} de {total:,} · {len(records):,} registros encontrados')
     doc.close()
     return pd.DataFrame(records),page_diag
 
-def make_excel(df):
+def make_excel(df, validation=None):
     bio=io.BytesIO()
     with pd.ExcelWriter(bio,engine='openpyxl') as writer:
         df.to_excel(writer,index=False,sheet_name='COI completo')
@@ -160,6 +195,8 @@ def make_excel(df):
         hor=df.groupby('HORARIO DE TRABAJO',dropna=False).agg(REGISTROS=('No.','count'),AUTORIZADOS=('ESTADO INTERPRETADO',lambda s:(s=='AUTORIZADO').sum()),NO_AUTORIZADOS=('ESTADO INTERPRETADO',lambda s:(s=='NO AUTORIZADO').sum()),EMERGENCIAS=('ESTADO INTERPRETADO',lambda s:(s=='FORMALIZACIÓN DE EMERGENCIA').sum())).reset_index().sort_values('REGISTROS',ascending=False)
         hor.to_excel(writer,index=False,sheet_name='Horarios')
         loc=df.groupby('LOCALIDAD',dropna=False).size().reset_index(name='REGISTROS').sort_values('REGISTROS',ascending=False); loc.to_excel(writer,index=False,sheet_name='Localidades')
+        if validation is not None:
+            validation.to_excel(writer,index=False,sheet_name='Validación extracción')
     bio.seek(0)
     wb=load_workbook(bio); 
     for ws in wb.worksheets:
@@ -184,15 +221,22 @@ with st.sidebar:
     st.write('2️⃣ Analiza el COI')
     st.write('3️⃣ Filtra empresas y contratos')
     st.write('4️⃣ Genera la lista')
-    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 10.0</div>',unsafe_allow_html=True)
+    st.divider(); st.markdown('<div class="small">Monitor COI · SDM Bogotá<br>Versión 10.1</div>',unsafe_allow_html=True)
 
 uploaded=st.file_uploader('📥 CARGA 1 · Selecciona el COI oficial en PDF',type=['pdf'])
 if uploaded:
     data=uploaded.getvalue(); st.caption(f'Archivo: **{uploaded.name}** · {len(data)/1024/1024:.1f} MB')
     if st.button('🔎 ANALIZAR COI',type='primary',use_container_width=True):
-        with st.spinner('Analizando las celdas del COI...'):
-            df,diag=extract_pdf(data)
-        st.session_state['coi_df']=df; st.session_state['coi_data']=data; st.session_state['coi_name']=uploaded.name; st.session_state['diag']=diag
+        st.session_state.pop('filtered',None)
+        progress=st.progress(0, text='Preparando análisis del COI...')
+        status=st.empty()
+        status.info('⏳ Iniciando extracción página por página...')
+        df,diag=extract_pdf(data, progress)
+        progress.progress(100, text=f'✅ Análisis terminado · {len(df):,} registros extraídos')
+        status.success('✅ Extracción terminada. Ahora se valida lo extraído frente al texto del PDF...')
+        validation=source_validation(data, df)
+        status.success('✅ Validación terminada.')
+        st.session_state['coi_df']=df; st.session_state['coi_data']=data; st.session_state['coi_name']=uploaded.name; st.session_state['diag']=diag; st.session_state['validation']=validation
         st.session_state['generated']=True
         st.rerun()
 
@@ -200,6 +244,22 @@ if 'coi_df' not in st.session_state: st.info('Carga el PDF y pulsa **ANALIZAR CO
 else:
     df=st.session_state['coi_df'].copy(); data=st.session_state['coi_data']
     st.success(f"✅ {st.session_state['coi_name']} · **{len(df):,} registros extraídos** · {sum(n>0 for _,n in st.session_state['diag']):,} páginas con datos")
+    validation=st.session_state.get('validation',pd.DataFrame())
+    with st.expander('✅ Validación de extracción · PDF vs. registros extraídos', expanded=True):
+        if not validation.empty:
+            ok=int((validation['VALIDACIÓN']=='✅ OK').sum())
+            rev=int((validation['VALIDACIÓN']=='⚠️ REVISAR').sum())
+            m1,m2,m3=st.columns(3)
+            m1.metric('Empresas/contratos validados',f'{len(validation):,}')
+            m2.metric('Coincidencias OK',f'{ok:,}')
+            m3.metric('Revisar',f'{rev:,}')
+            st.dataframe(validation,use_container_width=True,hide_index=True)
+            if rev:
+                st.warning('Se detectaron diferencias entre las apariciones estimadas en el texto del PDF y los registros extraídos. Revisa las filas marcadas antes de usar el resultado para control.')
+            else:
+                st.success('La validación no detectó diferencias en los contratistas/contratos analizados.')
+        else:
+            st.info('No se pudo construir la validación para este archivo.')
     if len(df):
         companies=sorted([x for x in df['CONTRATISTA'].dropna().unique() if clean(x)],key=lambda x:x.upper())
         contracts=sorted([x for x in df['CONTRATO CANÓNICO'].dropna().unique() if clean(x)])
@@ -252,7 +312,7 @@ else:
                 st.write({k:rr[k] for k in ['No.','CIV INICIO','CIV FIN','DIRECCIÓN DE LA OBRA INICIO','DIRECCIÓN DE LA OBRA FIN','CONTRATISTA','No. CONTRATO','HORARIO DE TRABAJO','HORARIO DE CIERRE','AUTORIZADO','LOCALIDAD','PÁGINA PDF']})
                 st.download_button('📄 Descargar página original del PDF',pdf_pages(data,[int(rr['PÁGINA PDF'])]),file_name=f'COI_pagina_{int(rr["PÁGINA PDF"])}.pdf',mime='application/pdf')
             with tab4:
-                st.download_button('📊 Descargar Excel completo filtrado',make_excel(result),file_name='Monitor_COI_resultado.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                st.download_button('📊 Descargar Excel completo filtrado',make_excel(result, source_validation(data, result)),file_name='Monitor_COI_resultado.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
                 pages=pdf_pages(data,result['PÁGINA PDF'].astype(int).tolist()); st.download_button('📄 Descargar PDF con páginas originales',pages,file_name='Monitor_COI_paginas_seleccionadas.pdf',mime='application/pdf')
                 hor=result.groupby('HORARIO DE TRABAJO').agg(REGISTROS=('No.','count'),AUTORIZADOS=('ESTADO INTERPRETADO',lambda s:(s=='AUTORIZADO').sum()),NO_AUTORIZADOS=('ESTADO INTERPRETADO',lambda s:(s=='NO AUTORIZADO').sum()),EMERGENCIAS=('ESTADO INTERPRETADO',lambda s:(s=='FORMALIZACIÓN DE EMERGENCIA').sum())).reset_index().sort_values('REGISTROS',ascending=False)
                 st.dataframe(hor,use_container_width=True,hide_index=True)
