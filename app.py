@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-APP_VERSION='11.0'
+APP_VERSION='11.1'
 APP_NAME='Monitor COI'
 COLS=['No.','CIV INICIO','CIV FIN','DIRECCIÓN DE LA OBRA INICIO','DIRECCIÓN DE LA OBRA FIN','CONTRATISTA','FECHA INICIO','FECHA FIN','HORARIO DE TRABAJO','HORARIO DE CIERRE','No. CONTRATO','OBSERVACIONES','AUTORIZADO','LOCALIDAD','ING. RESPONSABLE','No RADICADO SDM']
 
@@ -244,6 +244,37 @@ def source_validation(data, df):
             'VALIDACIÓN':'🔎 REVISAR MANUALMENTE' if diff!=0 else '✅ COINCIDE',
         })
     return pd.DataFrame(rows).sort_values(['VALIDACIÓN','REGISTROS_EXTRAÍDOS'],ascending=[True,False]).reset_index(drop=True)
+
+def extract_pdf(data, progress=None):
+    doc=fitz.open(stream=data,filetype='pdf')
+    records=[]; page_diag=[]; total=len(doc)
+    for pi,page in enumerate(doc):
+        rows=extract_page(page)
+        txt=page.get_text('text').upper()
+        section='SECCIÓN 1' if 'SECCIÓN 1.' in txt else ('SECCIÓN 2' if 'SECCIÓN 2.' in txt else '')
+        page_diag.append((pi+1,len(rows)))
+        for r in rows:
+            r=r[:16]+['']*max(0,16-len(r))
+            rec=dict(zip(COLS,r[:16]))
+            rec['PÁGINA PDF']=pi+1
+            rec['SECCIÓN']=section
+            rec['CONTRATO CANÓNICO']=contract_canonical(rec['No. CONTRATO'])
+            auth=norm(rec['AUTORIZADO']); obs=norm(rec['OBSERVACIONES'])
+            if 'EMERGENCIA' in auth or 'FORMALIZACIONDEEMERGENCIA' in auth:
+                state='FORMALIZACIÓN DE EMERGENCIA'
+            elif auth in ('NO','NOAUTORIZADO','NOAUTORIZADA'):
+                state='NO AUTORIZADO'
+            elif auth in ('SI','SIAUTORIZADO','AUTORIZADO','AUTORIZADOCONOBSERVACIONES') or 'AUTORIZA' in obs:
+                state='AUTORIZADO'
+            else:
+                state=clean(rec['AUTORIZADO']) or 'OTRO'
+            rec['ESTADO INTERPRETADO']=state
+            records.append(rec)
+        if progress is not None:
+            pct=int(((pi+1)/max(total,1))*100)
+            progress.progress(pct, text=f'Analizando página {pi+1:,} de {total:,} · {len(records):,} registros encontrados')
+    doc.close()
+    return pd.DataFrame(records),page_diag
 
 def make_excel(df, validation=None):
     bio=io.BytesIO()
